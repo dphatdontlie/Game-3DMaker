@@ -5,9 +5,12 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { primitive, disposeObject } from './geometry';
+import { own, isOwned } from './ownership';
+import { primitive, disposeObject, disposeModelInstance } from './geometry';
 import { makeObject, strokePositions } from '../shared/model';
 import type { Asset, Kind, Project, SceneObject, Vec3 } from '../shared/schema';
+import { checkGLB } from '../shared/glb';
+export { checkGLB } from '../shared/glb';
 
 export type Tool = 'select' | 'build' | 'erase' | 'translate' | 'rotate' | 'scale' | 'spawn' | 'sample';
 export type View = 'orbit' | 'top' | 'fly';
@@ -26,6 +29,7 @@ export interface EditorSettings {
   collisionHelpers: boolean;
   buildHeight: number | null;
   flySpeed: number;
+  texture?: SceneObject['texture'];
 }
 export interface WorldEvents {
   select: (ids: string[], add: boolean) => void;
@@ -38,31 +42,10 @@ export interface WorldEvents {
   info: (message: string) => void;
   walkEnd: () => void;
   position: (p: Vec3) => void;
+  loading?: (count: number) => void;
 }
 const tuple = (v: THREE.Vector3): Vec3 => [v.x, v.y, v.z];
 const radians = (v: THREE.Euler): Vec3 => [v.x, v.y, v.z];
-export function checkGLB(buffer: ArrayBuffer) {
-  const v = new DataView(buffer);
-  if (
-    buffer.byteLength < 20 ||
-    v.getUint32(0, true) !== 0x46546c67 ||
-    v.getUint32(4, true) !== 2 ||
-    v.getUint32(8, true) !== buffer.byteLength
-  )
-    throw new Error('File không phải GLB 2.0 hợp lệ.');
-  if (v.getUint32(16, true) !== 0x4e4f534a || v.getUint32(12, true) > buffer.byteLength - 20)
-    throw new Error('GLB thiếu phần mô tả.');
-  const json = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 20, v.getUint32(12, true))));
-  for (const item of [...(json.buffers ?? []), ...(json.images ?? [])])
-    if (item.uri && !/^data:/.test(item.uri))
-      throw new Error('GLB cần đóng gói ảnh và dữ liệu bên trong file, không dùng đường dẫn ngoài.');
-  if (
-    (json.extensionsRequired ?? []).some((s: string) =>
-      ['KHR_draco_mesh_compression', 'EXT_meshopt_compression', 'KHR_texture_basisu'].includes(s),
-    )
-  )
-    throw new Error('GLB này dùng nén chưa hỗ trợ. Hãy xuất GLB không nén Draco/Meshopt/KTX2.');
-}
 export class World {
   renderer: THREE.WebGLRenderer;
   scene = new THREE.Scene();
@@ -79,6 +62,7 @@ export class World {
   signatures = new Map<string, string>();
   models = new Map<string, THREE.Group>();
   pendingModels = new Map<string, Promise<THREE.Group>>();
+  textureCache = new Map<string, Promise<THREE.Texture>>();
   selection: string[] = [];
   outlines: THREE.BoxHelper[] = [];
   collisionLines: THREE.Box3Helper[] = [];
@@ -290,9 +274,14 @@ export class World {
     if (this.models.has(asset.id)) return this.models.get(asset.id)!;
     if (this.pendingModels.has(asset.id)) return this.pendingModels.get(asset.id)!;
     const task = (async () => {
-      const bytes = Uint8Array.from(atob(asset.data.split(',')[1]), (c) => c.charCodeAt(0));
-      checkGLB(bytes.buffer);
-      const gltf = await new GLTFLoader().parseAsync(bytes.buffer, '');
+      let buffer: ArrayBuffer;
+      if (asset.fileId) {
+        const response = await fetch(`/api/assets/${asset.fileId}`);
+        if (!response.ok) throw new Error('Không đọc được file GLB trên máy.');
+        buffer = await response.arrayBuffer();
+      } else buffer = Uint8Array.from(atob(asset.data!.split(',')[1]), (c) => c.charCodeAt(0)).buffer;
+      checkGLB(buffer);
+      const gltf = await new GLTFLoader().parseAsync(buffer, '');
       const container = new THREE.Group();
       const model = gltf.scene;
       const b = new THREE.Box3().setFromObject(model),
@@ -316,10 +305,12 @@ export class World {
       return container;
     })();
     this.pendingModels.set(asset.id, task);
+    this.events?.loading?.(this.pendingModels.size);
     try {
       return await task;
     } finally {
       this.pendingModels.delete(asset.id);
+      this.events?.loading?.(this.pendingModels.size);
     }
   }
   async validateAsset(asset: Asset) {
@@ -332,6 +323,65 @@ export class World {
     return Math.round(triangles);
   }
   private async instance(o: SceneObject) {
+    const n = await this.baseInstance(o);
+    if (o.texture) {
+      const asset = this.project?.assets.find((a) => a.id === o.texture!.assetId && a.type === 'texture');
+      if (!asset?.fileId) throw new Error('Không tìm thấy ảnh texture.');
+      let task = this.textureCache.get(asset.fileId);
+      if (!task) {
+        task = new THREE.TextureLoader().loadAsync(`/api/assets/${asset.fileId}`);
+        this.textureCache.set(asset.fileId, task);
+        task.catch(() => this.textureCache.delete(asset.fileId!));
+      }
+      const base = await task,
+        map = base.clone();
+      map.colorSpace = THREE.SRGBColorSpace;
+      map.wrapS = map.wrapT = THREE.RepeatWrapping;
+      map.repeat.set(...o.texture.repeat);
+      map.center.set(0.5, 0.5);
+      map.rotation = (o.texture.rotation * Math.PI) / 180;
+      map.needsUpdate = true;
+      own(map);
+      n.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          if (!child.geometry.attributes.uv) {
+            const g = child.geometry.clone(),
+              p = g.attributes.position;
+            g.computeBoundingBox();
+            const box = g.boundingBox!,
+              size = box.getSize(new THREE.Vector3()),
+              axes = [0, 1, 2].sort((a, b) => size.getComponent(b) - size.getComponent(a));
+            const uv: number[] = [];
+            for (let i = 0; i < p.count; i++) {
+              uv.push(
+                (p.getComponent(i, axes[0]) - box.min.getComponent(axes[0])) /
+                  (size.getComponent(axes[0]) || 1),
+                (p.getComponent(i, axes[1]) - box.min.getComponent(axes[1])) /
+                  (size.getComponent(axes[1]) || 1),
+              );
+            }
+            g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+            own(g);
+            child.geometry = g;
+          }
+          const materials = (Array.isArray(child.material) ? child.material : [child.material]).map((m) => {
+            const next =
+              m instanceof THREE.MeshStandardMaterial ? m.clone() : new THREE.MeshStandardMaterial();
+            next.map = map;
+            next.color.set(o.color);
+            next.roughness = o.roughness;
+            next.metalness = o.metalness;
+            own(next);
+            if (o.kind !== 'model' || isOwned(m)) m.dispose();
+            return next;
+          });
+          child.material = materials.length === 1 ? materials[0] : materials;
+        }
+      });
+    }
+    return n;
+  }
+  private async baseInstance(o: SceneObject) {
     if (o.kind !== 'model') return primitive(o);
     const asset = this.project?.assets.find((a) => a.id === o.assetId);
     if (!asset) throw new Error('Không tìm thấy tài nguyên mô hình.');
@@ -353,12 +403,14 @@ export class World {
     }
     if (o.tint || o.material !== 'plain')
       n.traverse((child) => {
-        if (child instanceof THREE.Mesh)
+        if (child instanceof THREE.Mesh) {
           child.material = new THREE.MeshStandardMaterial({
             color: o.color,
             roughness: o.roughness,
             metalness: o.metalness,
           });
+          own(child.material);
+        }
       });
     return n;
   }
@@ -452,6 +504,7 @@ export class World {
       if (!current.has(id)) {
         this.root.remove(n);
         if (n.userData.kind !== 'model') disposeObject(n);
+        else disposeModelInstance(n);
         this.objects.delete(id);
         this.signatures.delete(id);
       }
@@ -463,6 +516,7 @@ export class World {
       if (existing) {
         this.root.remove(existing);
         if (existing.userData.kind !== 'model') disposeObject(existing);
+        else disposeModelInstance(existing);
         this.objects.delete(o.id);
       }
       void this.instance(o)
@@ -484,6 +538,21 @@ export class World {
         })
         .catch((e) => this.events.error(`Không mở được ${o.name}: ${e.message}`));
     }
+    const resourceIds = new Set(project.assets.map((a) => a.id));
+    for (const [id, model] of this.models)
+      if (!resourceIds.has(id)) {
+        disposeObject(model, true);
+        this.models.delete(id);
+      }
+    const textureIds = new Set(project.assets.filter((a) => a.type === 'texture').map((a) => a.fileId));
+    for (const [id, promise] of this.textureCache)
+      if (!textureIds.has(id)) {
+        void promise.then(
+          (t) => t.dispose(),
+          () => {},
+        );
+        this.textureCache.delete(id);
+      }
     this.selection = selection.filter((id) =>
       project.objects.some((o) => o.id === id && o.visible && !o.locked),
     );
@@ -597,6 +666,7 @@ export class World {
       this.settings.color,
       this.settings.material,
       this.settings.rotation,
+      this.settings.texture,
     ]);
     if (this.ghost?.userData.key === key) {
       this.ghost.visible = this.settings.tool === 'build' && !this.settings.walk;
@@ -613,6 +683,7 @@ export class World {
     o.color = this.settings.color;
     o.material = this.settings.material;
     o.assetId = this.settings.assetId;
+    o.texture = this.settings.texture;
     if (o.kind === 'model') o.name = this.project?.assets.find((a) => a.id === o.assetId)?.name ?? 'Mô hình';
     if (o.kind === 'model') o.scale = [3, 3, 3];
     try {

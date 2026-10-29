@@ -42,13 +42,14 @@ Máy chủ chỉ lắng nghe tại `127.0.0.1`. Không cần tài khoản, API k
 - Đặt khối có bản mờ; kéo để xây/xóa liên tiếp; bám lưới 0,25/0,5/1/2 m hoặc đặt tự do; cố định độ cao xây.
 - Chọn nhiều, chọn vùng bằng Shift + kéo, gom/tách nhóm, nhân bản, lặp thành hàng, căn hàng theo Z, đặt xuống nền, khóa và ẩn vật thể.
 - Vật liệu đá, gạch, gỗ, cỏ, ngói, màu trơn; chỉnh màu, độ nhám, độ kim loại; bảng màu lưu cùng dự án.
+- Gán ảnh texture riêng cho bộ phận: chọn PNG/JPEG/WebP từ máy, nút dán clipboard hoặc Ctrl+V; chỉnh lặp ngang/dọc và góc xoay, dùng lại ảnh đã nhập. Texture đi theo khi nhân bản, lưu mẫu và undo/redo.
 - Góc phối cảnh, nhìn từ trên, bay, nhìn gần vật thể, đưa toàn cảnh vào khung hình; nhớ camera trong trình duyệt.
 - Nhập GLB, đặt nhiều bản sao; thay màu gốc khi cần; tách các phần hình học có sẵn của GLB thành vật thể độc lập. Có thể gỡ tài nguyên không còn được cảnh/mẫu sử dụng.
 - Lưu mẫu gồm nhiều bộ phận ngay trong dự án, giữ tài nguyên đi kèm khi xuất gói.
 - Đi bộ, chạy, nhảy, va chạm đơn giản, lên bậc thấp, trở về điểm bắt đầu, đặt điểm bắt đầu ngay trong xưởng.
 - Chỉnh kích thước nền, màu trời/đất, hướng nắng, bóng đổ và chất lượng; xem hộp va chạm.
 - Hoàn tác/làm lại tối đa 80 bước trong phiên làm việc; tự lưu, lưu thủ công, 5 bản dự phòng; phát hiện xung đột khi hai cửa sổ cùng sửa dự án.
-- Xuất gói `.3dmaker.json` tự chứa tài nguyên, GLB toàn cảnh hoặc phần đang chọn, và ảnh PNG không có bảng công cụ hay tay nắm.
+- Xuất gói `.3dmaker.zip` chứa cả bản đồ, GLB và ảnh; GLB toàn cảnh hoặc phần đang chọn; ảnh PNG không có bảng công cụ hay tay nắm. Vẫn nhập được gói JSON cũ.
 - Hướng dẫn và phím tắt trong app. Màn hình hẹp có nút **Thuộc tính** để mở bảng chỉnh.
 
 ## Phím tắt
@@ -76,12 +77,25 @@ Máy chủ chỉ lắng nghe tại `127.0.0.1`. Không cần tài khoản, API k
 
 ```text
 data/
-  <project-id>.json     Bản đồ và tài nguyên GLB nhúng
+  <project-id>.json     Mô tả bản đồ, tham chiếu tới file GLB/ảnh
+  assets/               File GLB/texture riêng và thông tin đi kèm
   backups/              Tối đa 5 phiên bản trước cho mỗi dự án
   trash/                Dự án đã cất, có thể lấy lại thủ công
 ```
 
 Thư mục `data/` được Git bỏ qua. Push/pull mã nguồn không đưa bản đồ của bạn lên GitHub. Để chuyển bản đồ sang máy khác, dùng **Xuất → Gói dự án**, rồi nhập gói đó trên máy đích. Có thể sao lưu cả thư mục `data/` khi app đã dừng.
+
+GLB mới được tải thẳng xuống file trên đĩa, không chuyển thành chuỗi base64 và không ghi lại vào mỗi bản lưu. Khi sao lưu thủ công cần giữ **toàn bộ data/**, đặc biệt `data/assets/`. Bản đồ cũ có GLB nhúng vẫn mở được. Gói ZIP xuất mới đóng gói cả tài nguyên cũ và mới.
+
+**Bản mô tả .3dmaker.json** là cách giữ thay đổi khi máy chủ local gặp sự cố, có thể xuất ngay cả khi máy chủ đã dừng. Với tài nguyên file riêng, JSON này chỉ dùng lại được khi còn các file trong `data/assets/`; để chuyển máy hãy dùng ZIP.
+
+## Dán ảnh lên tường hoặc bộ phận
+
+Chọn vật thể trong cảnh hoặc danh sách, kéo bảng Thuộc tính tới **Ảnh texture**, rồi chọn ảnh từ máy hoặc bấm **Dán ảnh clipboard**. Cũng có thể nhấn Ctrl+V khi đang chọn vật thể và không nhập chữ trong ô tên/số.
+
+Đặt **Lặp ngang**, **Lặp dọc** để đổi mật độ gạch và **Xoay ảnh** để đổi hướng. Chọn **Dùng ảnh đã nhập** để áp dụng cùng một ảnh cho bộ phận khác. **Gỡ texture khỏi bộ phận** không xóa file ảnh khỏi dữ liệu dự án. Chọn vật liệu dựng sẵn sẽ gỡ texture riêng để dùng vật liệu đó.
+
+Ảnh tối đa 32 MB; cạnh dài được thu về tối đa 4096 px để giảm tải GPU. Mặc định giữ PNG; ảnh quá lớn sau xử lý được tối ưu sang WebP. Trên GLB, ảnh theo UV gốc; nếu thiếu UV, app tạo phép chiếu phẳng cơ bản, có thể bị kéo giãn trên các mặt khác hướng.
 
 Khôi phục bản dự phòng ngay trong app. Với dự án hỏng, mở **Dự án → Bản dự phòng** để khôi phục thành dự án mới. Muốn lấy lại dự án trong thùng lưu, khi app đã dừng, chép file từ `data/trash/<id>_<thời điểm>.json` về `data/<id>.json`, giữ nguyên phần `<id>` và tránh ghi đè một dự án đang tồn tại.
 
@@ -90,7 +104,7 @@ Nếu lưu thất bại, app giữ thay đổi trong phiên hiện tại và cho
 ## Giới hạn của bản này
 
 - Ưu tiên chuột và bàn phím trên máy tính. Giao diện thu gọn được trên màn hình hẹp, chưa có bộ điều khiển xây/đi bộ bằng cảm ứng.
-- Mỗi GLB tối đa 32 MB; gói lưu tối đa 64 MB; tối đa 5.000 vật thể, 30 tài nguyên và 50 mẫu. Đây là giới hạn dữ liệu, không phải cam kết tốc độ ở mức tối đa.
+- Mỗi GLB **nhỏ hơn 1 GB (1.000.000.000 byte)**; ảnh texture tối đa 32 MB; mô tả bản đồ tối đa 64 MB, ZIP tối đa 4 GiB và tổng tài nguyên cần nhỏ hơn giới hạn gói. Tối đa 5.000 vật thể, 100 tài nguyên và 50 mẫu. Đây là giới hạn dữ liệu, không phải cam kết tốc độ ở mức tối đa. Đã thử GLB khoảng 40 MB, chưa benchmark mô hình gần 1 GB; file lớn cần đủ RAM/GPU.
 - GLB cần nhúng dữ liệu và ảnh bên trong. Chưa hỗ trợ Draco, Meshopt, KTX2 hoặc phát animation. Mô hình có bộ xương vẫn có thể đặt dạng tĩnh, nhưng không tách thành bộ phận.
 - Tách GLB dựa trên phần hình học thực sự có trong file (tối đa 300 phần); không tự nhận diện mái/cửa/cột của một khối liền. Không có chỉnh từng đỉnh hoặc điêu khắc.
 - Va chạm dùng hộp bao từng phần; dốc dùng các bậc nhỏ xấp xỉ. Vật thể xoay, tán cây hoặc mô hình cong có thể chặn rộng hơn hình nhìn thấy. Có thể tắt va chạm trên các vật thể trang trí.
@@ -115,3 +129,5 @@ npm run build
 `npm test` kiểm tra dữ liệu dự án, undo/redo, nhân bản nhóm, GLB, hình học cổng/bậc thang, bảo toàn vị trí khi tách mô hình, lưu nguyên tử, xung đột, xoay vòng bản dự phòng và API local. GitHub Actions chạy test và build khi có push/PR.
 
 `npx tsx scripts/create-test-assets.ts` tạo các file kiểm thử trong `test-results/` để thử nhập GLB hợp lệ, GLB lỗi và gói dự án lỗi qua giao diện. Kết quả kiểm tra thực tế được ghi ở [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+`npx tsx scripts/create-texture-test-assets.ts` tạo ảnh gạch và GLB khoảng 40 MB để thử tính năng texture/file lớn. Test API bao gồm upload có giới hạn, tải theo Range, ZIP chứa tài nguyên, chống đường dẫn lạ và từ chối gói thiếu file.

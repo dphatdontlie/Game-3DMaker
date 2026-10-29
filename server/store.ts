@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { projectSchema, type Project } from '../src/shared/schema';
+import { assetInfo } from './assets';
 
 export class StoreError extends Error {
   constructor(
@@ -62,6 +63,12 @@ export class ProjectStore {
     if (!parsed.success)
       throw new StoreError('Dữ liệu bản đồ không hợp lệ: ' + parsed.error.issues[0].message);
     const p = parsed.data;
+    for (const a of p.assets)
+      if (a.fileId) {
+        const info = await assetInfo(this.root, a.fileId);
+        if (info.bytes !== a.bytes || (info.type ?? 'glb') !== (a.type ?? 'glb'))
+          throw new StoreError('Thông tin tài nguyên không khớp file trên máy.');
+      }
     const action = async () => {
       await this.init();
       const dest = this.file(p.id);

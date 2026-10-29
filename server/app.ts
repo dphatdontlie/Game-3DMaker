@@ -1,5 +1,7 @@
 import express from 'express';
 import { ProjectStore, StoreError } from './store';
+import { assetInfo, assetPath, uploadAsset, UploadError } from './assets';
+import { bundleRouter } from './bundles';
 export function createApp(root: string) {
   const app = express(),
     store = new ProjectStore(root);
@@ -14,7 +16,19 @@ export function createApp(root: string) {
     next();
   });
   app.use(express.json({ limit: '64mb' }));
+  app.post('/api/assets', async (req, res) => {
+    const type = req.query.type;
+    if (type !== 'glb' && type !== 'texture')
+      return res.status(400).json({ error: 'Loại tài nguyên không hợp lệ.' });
+    res.status(201).json(await uploadAsset(root, req, type, String(req.query.name ?? 'Tài nguyên')));
+  });
+  app.get('/api/assets/:id', async (req, res) => {
+    const info = await assetInfo(root, req.params.id);
+    res.type(info.mime ?? 'model/gltf-binary');
+    res.sendFile(assetPath(root, req.params.id));
+  });
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
+  app.use('/api', bundleRouter(root));
   app.get('/api/projects', async (_req, res) => res.json(await store.list()));
   app.post('/api/projects', async (req, res) => res.status(201).json(await store.save(req.body, true)));
   app.get('/api/projects/:id', async (req, res) => res.json(await store.load(req.params.id)));
@@ -32,11 +46,12 @@ export function createApp(root: string) {
   );
   app.use('/api', (_req, res) => res.status(404).json({ error: 'Không tìm thấy API.' }));
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (_req.aborted || res.destroyed) return;
     const status = err instanceof StoreError ? err.status : ((err as { status?: number }).status ?? 500);
     if (status === 500) console.error(err);
     res.status(status).json({
       error:
-        err instanceof StoreError
+        err instanceof StoreError || err instanceof UploadError
           ? err.message
           : status === 413
             ? 'Gói dự án vượt 64 MB.'

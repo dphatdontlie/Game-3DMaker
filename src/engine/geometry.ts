@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { SceneObject } from '../shared/schema';
+import { isOwned } from './ownership';
 
 const textures = new Map<string, THREE.CanvasTexture>();
 function texture(kind: string) {
@@ -127,7 +128,7 @@ export function primitive(o: SceneObject): THREE.Group {
   });
   return root;
 }
-export function disposeObject(object: THREE.Object3D) {
+export function disposeObject(object: THREE.Object3D, allTextures = false) {
   const materials = new Set<THREE.Material>(),
     geometries = new Set<THREE.BufferGeometry>();
   object.traverse((n) => {
@@ -137,5 +138,26 @@ export function disposeObject(object: THREE.Object3D) {
     }
   });
   geometries.forEach((g) => g.dispose());
-  materials.forEach((m) => m.dispose());
+  materials.forEach((m) => {
+    if (allTextures)
+      for (const value of Object.values(m)) if (value instanceof THREE.Texture) value.dispose();
+    const map = (m as THREE.MeshStandardMaterial).map;
+    if (map && isOwned(map)) map.dispose();
+    m.dispose();
+  });
+}
+export function disposeModelInstance(object: THREE.Object3D) {
+  const maps = new Set<THREE.Texture>();
+  object.traverse((n) => {
+    if (n instanceof THREE.Mesh) {
+      if (isOwned(n.geometry)) n.geometry.dispose();
+      for (const m of Array.isArray(n.material) ? n.material : [n.material])
+        if (isOwned(m)) {
+          const map = (m as THREE.MeshStandardMaterial).map;
+          if (map && isOwned(map)) maps.add(map);
+          m.dispose();
+        }
+    }
+  });
+  maps.forEach((m) => m.dispose());
 }

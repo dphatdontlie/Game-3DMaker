@@ -1,5 +1,7 @@
 # Kiểm tra bản bàn giao
 
+Cập nhật texture và GLB lớn ngày 29/10/2026: xem [TEXTURE_UPLOAD_VERIFICATION.md](TEXTURE_UPLOAD_VERIFICATION.md). Các giới hạn trong báo cáo dưới đây là của bản đầu ngày 28/10.
+
 Ngày kiểm tra: 28/10/2026, múi giờ Asia/Bangkok. Môi trường: Windows, Node.js 24.17.0, trình duyệt tích hợp của Codex, WebGL thực tế. App được chạy cả bằng lệnh phát triển và từ bản build với `npm start` tại http://localhost:4317.
 
 ## Tự động

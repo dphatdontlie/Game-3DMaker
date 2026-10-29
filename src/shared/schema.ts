@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_GLB_BYTES, MAX_TEXTURE_BYTES } from './limits';
 
 export const kinds = [
   'block',
@@ -43,20 +44,34 @@ export const objectSchema = z.object({
   modelPart: z.array(z.number().int().min(0).max(100000)).max(64).optional(),
   modelPartOrigin: vec3.optional(),
   tint: z.boolean().optional(),
+  texture: z
+    .object({
+      assetId: z.string().uuid(),
+      repeat: z.tuple([z.number().min(0.05).max(100), z.number().min(0.05).max(100)]),
+      rotation: z.number().min(-3600).max(3600),
+    })
+    .optional(),
 });
-export const assetSchema = z.object({
-  id: z.string().uuid(),
-  name: z.string().min(1).max(120),
-  data: z
-    .string()
-    .max(45000000)
-    .regex(/^data:model\/gltf-binary;base64,[A-Za-z0-9+/]+=*$/),
-  bytes: z
-    .number()
-    .int()
-    .positive()
-    .max(32 * 1024 * 1024),
-});
+export const assetSchema = z
+  .object({
+    id: z.string().uuid(),
+    name: z.string().min(1).max(120),
+    data: z
+      .string()
+      .max(45000000)
+      .regex(/^data:model\/gltf-binary;base64,[A-Za-z0-9+/]+=*$/)
+      .optional(),
+    fileId: z.string().uuid().optional(),
+    type: z.enum(['glb', 'texture']).optional(),
+    mime: z.enum(['model/gltf-binary', 'image/png', 'image/jpeg', 'image/webp']).optional(),
+    bytes: z.number().int().positive().max(MAX_GLB_BYTES),
+  })
+  .superRefine((a, ctx) => {
+    if (!!a.data === !!a.fileId)
+      ctx.addIssue({ code: 'custom', message: 'Tài nguyên cần đúng một nguồn dữ liệu.' });
+    if (a.type === 'texture' && (!a.fileId || a.bytes > MAX_TEXTURE_BYTES))
+      ctx.addIssue({ code: 'custom', message: 'Ảnh texture cần file riêng, tối đa 32 MB.' });
+  });
 export const prefabSchema = z.object({
   id: z.string().uuid(),
   name: z.string().min(1).max(100),
@@ -79,7 +94,7 @@ export const projectSchema = z
       .max(8)
       .optional(),
     objects: z.array(objectSchema).max(5000),
-    assets: z.array(assetSchema).max(30),
+    assets: z.array(assetSchema).max(100),
     prefabs: z.array(prefabSchema).max(50),
     environment: z.object({
       size: z.number().min(10).max(500),
@@ -98,9 +113,17 @@ export const projectSchema = z
     }
     const assets = new Set(p.assets.map((a) => a.id));
     if (assets.size !== p.assets.length) ctx.addIssue({ code: 'custom', message: 'Trùng mã tài nguyên.' });
+    const files = p.assets.flatMap((a) => (a.fileId ? [a.fileId] : []));
+    if (new Set(files).size !== files.length)
+      ctx.addIssue({ code: 'custom', message: 'Trùng file tài nguyên. Hãy dùng lại tài nguyên đã có.' });
     for (const o of [...p.objects, ...p.prefabs.flatMap((f) => f.objects)]) {
-      if (o.kind === 'model' && (!o.assetId || !assets.has(o.assetId)))
+      if (
+        o.kind === 'model' &&
+        (!o.assetId || !p.assets.some((a) => a.id === o.assetId && a.type !== 'texture'))
+      )
         ctx.addIssue({ code: 'custom', message: 'Mô hình thiếu tài nguyên GLB.' });
+      if (o.texture && !p.assets.some((a) => a.id === o.texture!.assetId && a.type === 'texture'))
+        ctx.addIssue({ code: 'custom', message: 'Bộ phận thiếu ảnh texture.' });
     }
   });
 export type Kind = (typeof kinds)[number];

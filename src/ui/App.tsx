@@ -1,5 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
-import { World, checkGLB, type EditorSettings, type Tool, type WorldEvents } from '../engine/World';
+import { World, type EditorSettings, type Tool, type WorldEvents } from '../engine/World';
+import { checkGLBFile } from '../shared/glb';
+import { MAX_GLB_BYTES, MAX_TEXTURE_BYTES } from '../shared/limits';
+import { uploadFile, uploadRequest as uploadBlob } from './uploads';
 import {
   catalog,
   cloneProject,
@@ -85,6 +88,7 @@ function download(data: BlobPart, name: string, type: string) {
 }
 const safeName = (s: string) => s.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').slice(0, 70);
 const ErrorContext = createContext('');
+const UploadContext = createContext({ status: '', cancel: () => {}, canCancel: false });
 function Modal({
   title,
   onClose,
@@ -98,6 +102,7 @@ function Modal({
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const error = useContext(ErrorContext);
+  const upload = useContext(UploadContext);
   useEffect(() => {
     const dialog = ref.current!;
     dialog.showModal();
@@ -124,6 +129,14 @@ function Modal({
         </p>
       )}
       {children}
+      {upload.status && (
+        <div className="dialog-upload" role="status">
+          <p>{upload.status}</p>
+          <button disabled={!upload.canCancel} onClick={upload.cancel}>
+            Hủy tải
+          </button>
+        </div>
+      )}
     </dialog>
   );
 }
@@ -209,6 +222,16 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [backupProjectId, setBackupProjectId] = useState('');
   const [walkPosition, setWalkPosition] = useState<Vec3>([0, 0, 0]);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadCanCancel, setUploadCanCancel] = useState(false),
+    [modelsLoading, setModelsLoading] = useState(0);
+  function trackUpload(xhr: XMLHttpRequest) {
+    uploadRequest.current = xhr;
+    setUploadCanCancel(true);
+    xhr.upload.addEventListener('loadend', () => setUploadCanCancel(false), { once: true });
+  }
+  const uploadRequest = useRef<XMLHttpRequest | null>(null),
+    textureInput = useRef<HTMLInputElement>(null);
   const changed = useRef(0),
     saved = useRef(0),
     saving = useRef<Promise<boolean> | null>(null),
@@ -217,6 +240,13 @@ export function App() {
     projectInput = useRef<HTMLInputElement>(null);
   const selected = project?.objects.filter((o) => selection.includes(o.id)) ?? [],
     first = selected[0];
+  const activeTexture = settings.tool === 'build' ? settings.texture : first?.texture;
+  const textureAsset = project?.assets.find((a) => a.id === activeTexture?.assetId);
+  function setTexture(texture: SceneObject['texture']) {
+    if (settings.tool === 'build')
+      setSettings((s) => ({ ...s, texture, ...(texture ? { color: '#ffffff' } : {}) }));
+    else patchSelected({ texture, ...(texture ? { color: '#ffffff' } : {}) });
+  }
   void undoVersion;
   const notify = useCallback((message: string) => setNotice(message), []);
   useEffect(() => {
@@ -429,6 +459,19 @@ export function App() {
     setError('');
     setBusy(true);
     try {
+      if (/\.zip$/i.test(file.name)) {
+        if (!(await save())) return;
+        const p = await uploadBlob<Project>(
+          file,
+          '/api/import-bundle',
+          (n) => setUploadStatus(`Đang nhập gói ZIP: ${n}%`),
+          trackUpload,
+        );
+        if (!(await save())) return;
+        open(p);
+        notify('Đã nhập gói ZIP và toàn bộ tài nguyên.');
+        return;
+      }
       if (file.size > 64 * 1024 * 1024) throw new Error('Gói dự án vượt 64 MB.');
       const parsed = projectSchema.safeParse(JSON.parse(await file.text()));
       if (!parsed.success) throw new Error('Gói dự án không hợp lệ: ' + parsed.error.issues[0].message);
@@ -442,6 +485,8 @@ export function App() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      setUploadStatus('');
+      uploadRequest.current = null;
       setBusy(false);
     }
   }
@@ -450,18 +495,22 @@ export function App() {
     if (!world.current) return;
     setBusy(true);
     try {
-      if (!/\.glb$/i.test(file.name) || file.size > 32 * 1024 * 1024)
-        throw new Error('Chọn file .glb không quá 32 MB.');
-      const buffer = await file.arrayBuffer();
-      checkGLB(buffer);
-      const data = await new Promise<string>((resolve, reject) => {
-        const r = new FileReader();
-        r.onload = () => resolve(String(r.result).replace(/^data:[^;]*;/, 'data:model/gltf-binary;'));
-        r.onerror = () => reject(new Error('Không đọc được file.'));
-        r.readAsDataURL(file);
-      });
-      const asset: Asset = { id: crypto.randomUUID(), name: file.name.slice(0, 120), bytes: file.size, data };
+      if (!/\.glb$/i.test(file.name) || file.size > MAX_GLB_BYTES)
+        throw new Error('Chọn file .glb nhỏ hơn 1 GB (1.000.000.000 byte).');
+      const projectId = projectRef.current?.id;
+      setUploadStatus('Đang kiểm tra GLB…');
+      await checkGLBFile(file);
+      const asset = await uploadFile(
+        file,
+        file.name,
+        'glb',
+        (n) => setUploadStatus(`Đang tải GLB: ${n}%`),
+        trackUpload,
+      );
+      setUploadStatus('Đang dựng mô hình, file lớn có thể mất thêm thời gian…');
       const triangles = await world.current.validateAsset(asset);
+      if (projectRef.current?.id !== projectId)
+        throw new Error('Đã đổi dự án trong lúc tải. Hãy nhập lại ở dự án cần dùng.');
       commit((p) => {
         p.assets.push(asset);
       });
@@ -472,9 +521,103 @@ export function App() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      setUploadStatus('');
+      uploadRequest.current = null;
       setBusy(false);
     }
   }
+  async function importTexture(file: File) {
+    if (!projectRef.current) return;
+    const targetIds = [...selectionRef.current],
+      build = settingsRef.current.tool === 'build',
+      projectId = projectRef.current.id;
+    if (!build && !targetIds.length) {
+      notify('Chọn bộ phận cần dán texture trước.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      if (file.size > MAX_TEXTURE_BYTES || !['image/png', 'image/jpeg', 'image/webp'].includes(file.type))
+        throw new Error('Chọn ảnh PNG, JPEG hoặc WebP tối đa 32 MB.');
+      setUploadStatus('Đang xử lý ảnh…');
+      const image = await createImageBitmap(file);
+      const canvas = document.createElement('canvas'),
+        ratio = Math.min(1, 4096 / Math.max(image.width, image.height));
+      canvas.width = Math.max(1, Math.round(image.width * ratio));
+      canvas.height = Math.max(1, Math.round(image.height * ratio));
+      canvas.getContext('2d')!.drawImage(image, 0, 0, canvas.width, canvas.height);
+      image.close();
+      let blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Không đọc được ảnh.'))), 'image/png'),
+      );
+      if (blob.size > MAX_TEXTURE_BYTES)
+        blob = await new Promise<Blob>((resolve, reject) =>
+          canvas.toBlob(
+            (b) => (b ? resolve(b) : reject(new Error('Không tối ưu được ảnh.'))),
+            'image/webp',
+            0.95,
+          ),
+        );
+      const asset = await uploadFile(
+        blob,
+        file.name || 'Ảnh clipboard.png',
+        'texture',
+        (n) => setUploadStatus(`Đang tải ảnh: ${n}%`),
+        trackUpload,
+      );
+      if (projectRef.current?.id !== projectId)
+        throw new Error('Đã đổi dự án. Chọn lại ảnh ở dự án cần dùng.');
+      const texture = { assetId: asset.id, repeat: [1, 1] as [number, number], rotation: 0 };
+      commit((p) => {
+        p.assets.push(asset);
+        if (!build)
+          for (const o of p.objects)
+            if (targetIds.includes(o.id) && !o.locked) {
+              o.texture = texture;
+              o.color = '#ffffff';
+            }
+      });
+      if (build) setSettings((s) => ({ ...s, texture, color: '#ffffff' }));
+      notify(
+        `Đã áp dụng texture ${asset.name}.${ratio < 1 ? ' Ảnh được thu nhỏ cạnh dài về 4096 px để nhẹ GPU.' : ''}`,
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+      setUploadStatus('');
+      uploadRequest.current = null;
+    }
+  }
+  async function pasteTexture() {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const type = item.types.find((t) => ['image/png', 'image/jpeg', 'image/webp'].includes(t));
+        if (type) {
+          const blob = await item.getType(type);
+          await importTexture(new File([blob], 'Ảnh clipboard.png', { type }));
+          return;
+        }
+      }
+      notify('Clipboard chưa có ảnh. Sao chép một ảnh rồi thử lại.');
+    } catch {
+      notify('Chọn bộ phận rồi nhấn Ctrl+V để dán ảnh, hoặc chọn ảnh từ máy.');
+    }
+  }
+  useEffect(() => {
+    const paste = (e: ClipboardEvent) => {
+      if (busy || panel || confirm || (e.target as HTMLElement).closest('input,textarea,select')) return;
+      const file = Array.from(e.clipboardData?.files ?? []).find((f) => f.type.startsWith('image/'));
+      if (file) {
+        e.preventDefault();
+        void importTexture(file);
+      }
+    };
+    window.addEventListener('paste', paste);
+    return () => window.removeEventListener('paste', paste);
+  });
   events.current = {
     select: choose,
     add: addObjects,
@@ -505,6 +648,7 @@ export function App() {
         assetId: o.assetId,
         color: o.color,
         material: o.material,
+        texture: o.texture,
         rotation: o.rotation[1],
       }));
       notify(`Đã lấy mẫu ${o.name}.`);
@@ -513,6 +657,7 @@ export function App() {
     info: notify,
     walkEnd: () => setSettings((s) => ({ ...s, walk: false })),
     position: setWalkPosition,
+    loading: setModelsLoading,
   };
   useEffect(() => {
     if (!host.current) return;
@@ -592,6 +737,7 @@ export function App() {
     o.rotation[1] = settings.rotation;
     o.color = settings.color;
     o.material = settings.material;
+    o.texture = settings.texture;
     if (o.kind === 'model') {
       o.assetId = settings.assetId;
       o.name = project.assets.find((a) => a.id === settings.assetId)?.name ?? 'Mô hình';
@@ -630,10 +776,34 @@ export function App() {
       setBusy(false);
     }
   }
-  function exportProject() {
+  async function exportProject() {
     const p = projectRef.current;
-    if (p) download(JSON.stringify(p, null, 2), `${safeName(p.name)}.3dmaker.json`, 'application/json');
-    notify('Đã xuất gói dự án, gồm tài nguyên GLB bên trong.');
+    if (!p) return;
+    setBusy(true);
+    setError('');
+    try {
+      const { url } = await api<{ url: string }>('/api/export-tickets', {
+        method: 'POST',
+        body: JSON.stringify(p),
+      });
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${safeName(p.name)}.3dmaker.zip`;
+      a.click();
+      notify('Đang xuất gói ZIP gồm bản đồ và tài nguyên. File lớn sẽ tải lâu hơn.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  function exportMetadata() {
+    const p = projectRef.current;
+    if (!p) return;
+    download(JSON.stringify(p, null, 2), `${safeName(p.name)}.3dmaker.json`, 'application/json');
+    notify(
+      'Đã xuất bản mô tả. Tài nguyên file riêng vẫn cần thư mục data/assets trên máy này; dùng ZIP để chuyển sang máy khác.',
+    );
   }
   async function exportGLB(selectedOnly = false) {
     if (!world.current || !project) return;
@@ -741,1258 +911,1406 @@ export function App() {
     ) ?? [];
   return (
     <ErrorContext.Provider value={error}>
-      <div className={`app ${settings.walk ? 'walking' : ''} ${inspectorOpen ? 'inspector-open' : ''}`}>
-        <header className="app-header">
-          <div className="wordmark">
-            <strong>
-              3DMaker<span> / </span>
-            </strong>
-            <span>Xưởng bản đồ</span>
-          </div>
-          <div className="project-title">
-            {project ? (
-              <input
-                aria-label="Tên dự án"
-                title="Đổi tên dự án"
-                key={project.id}
-                defaultValue={project.name}
-                maxLength={100}
-                onBlur={(e) => {
-                  const value = e.target.value.trim();
-                  if (value && value !== project.name)
-                    commit((p) => {
-                      p.name = value;
-                    });
-                  else e.target.value = project.name;
-                }}
-              />
-            ) : (
-              <span>Không gian sáng tạo của bạn</span>
-            )}
-            <span className={`save-status ${dirty ? 'unsaved' : ''}`} role="status">
-              {status}
-            </span>
-          </div>
-          <nav aria-label="Dự án">
-            <button onClick={() => setPanel('projects')}>Dự án</button>
-            <button disabled={!project || busy} onClick={() => void save()}>
-              Lưu <kbd>Ctrl S</kbd>
-            </button>
-            <button disabled={!project} onClick={() => setPanel('export')}>
-              Xuất
-            </button>
-            <button aria-label="Hướng dẫn sử dụng" onClick={() => setPanel('help')}>
-              ?
-            </button>
-          </nav>
-        </header>
-        <div className="workspace">
-          <aside className="library" aria-label="Thư viện và vật thể">
-            <div className="panel-tabs">
-              <button
-                className={libraryTab === 'library' ? 'active' : ''}
-                onClick={() => setLibraryTab('library')}
-              >
-                Thư viện
-              </button>
-              <button
-                className={libraryTab === 'objects' ? 'active' : ''}
-                onClick={() => setLibraryTab('objects')}
-              >
-                Vật thể <span>{project?.objects.length ?? 0}</span>
-              </button>
+      <UploadContext.Provider
+        value={{
+          status: uploadStatus,
+          cancel: () => uploadRequest.current?.abort(),
+          canCancel: uploadCanCancel,
+        }}
+      >
+        <div className={`app ${settings.walk ? 'walking' : ''} ${inspectorOpen ? 'inspector-open' : ''}`}>
+          <header className="app-header">
+            <div className="wordmark">
+              <strong>
+                3DMaker<span> / </span>
+              </strong>
+              <span>Xưởng bản đồ</span>
             </div>
-            {libraryTab === 'library' ? (
-              <div className="panel-content">
-                <label className="search-field">
-                  <span>Tìm bộ phận</span>
-                  <input
-                    value={query}
-                    placeholder="Tường, cây, mái…"
-                    onChange={(e) => setQuery(e.target.value)}
-                  />
-                </label>
-                <div className="category-tabs">
-                  {['Tất cả', 'Khối xây', 'Kiến trúc', 'Trang trí'].map((c) => (
-                    <button key={c} className={category === c ? 'active' : ''} onClick={() => setCategory(c)}>
-                      {c}
-                    </button>
-                  ))}
-                </div>
-                <div className="asset-grid">
-                  {shownCatalog.map((c) => (
-                    <button
-                      key={c.kind}
-                      disabled={!project}
-                      className={`asset ${settings.kind === c.kind && settings.tool === 'build' ? 'chosen' : ''}`}
-                      onClick={() =>
-                        setSettings((s) => ({
-                          ...s,
-                          tool: 'build',
-                          kind: c.kind,
-                          assetId: undefined,
-                          color: c.color,
-                        }))
-                      }
-                    >
-                      <span
-                        className={`asset-preview kind-${c.kind}`}
-                        style={{ '--asset-color': c.color } as React.CSSProperties}
-                        aria-hidden="true"
+            <div className="project-title">
+              {project ? (
+                <input
+                  aria-label="Tên dự án"
+                  title="Đổi tên dự án"
+                  key={project.id}
+                  defaultValue={project.name}
+                  maxLength={100}
+                  onBlur={(e) => {
+                    const value = e.target.value.trim();
+                    if (value && value !== project.name)
+                      commit((p) => {
+                        p.name = value;
+                      });
+                    else e.target.value = project.name;
+                  }}
+                />
+              ) : (
+                <span>Không gian sáng tạo của bạn</span>
+              )}
+              <span className={`save-status ${dirty ? 'unsaved' : ''}`} role="status">
+                {status}
+              </span>
+            </div>
+            <nav aria-label="Dự án">
+              <button onClick={() => setPanel('projects')}>Dự án</button>
+              <button disabled={!project || busy} onClick={() => void save()}>
+                Lưu <kbd>Ctrl S</kbd>
+              </button>
+              <button disabled={!project} onClick={() => setPanel('export')}>
+                Xuất
+              </button>
+              <button aria-label="Hướng dẫn sử dụng" onClick={() => setPanel('help')}>
+                ?
+              </button>
+            </nav>
+          </header>
+          <div className="workspace">
+            <aside className="library" aria-label="Thư viện và vật thể">
+              <div className="panel-tabs">
+                <button
+                  className={libraryTab === 'library' ? 'active' : ''}
+                  onClick={() => setLibraryTab('library')}
+                >
+                  Thư viện
+                </button>
+                <button
+                  className={libraryTab === 'objects' ? 'active' : ''}
+                  onClick={() => setLibraryTab('objects')}
+                >
+                  Vật thể <span>{project?.objects.length ?? 0}</span>
+                </button>
+              </div>
+              {libraryTab === 'library' ? (
+                <div className="panel-content">
+                  <label className="search-field">
+                    <span>Tìm bộ phận</span>
+                    <input
+                      value={query}
+                      placeholder="Tường, cây, mái…"
+                      onChange={(e) => setQuery(e.target.value)}
+                    />
+                  </label>
+                  <div className="category-tabs">
+                    {['Tất cả', 'Khối xây', 'Kiến trúc', 'Trang trí'].map((c) => (
+                      <button
+                        key={c}
+                        className={category === c ? 'active' : ''}
+                        onClick={() => setCategory(c)}
                       >
-                        {c.glyph}
-                      </span>
-                      <span>{c.name}</span>
-                    </button>
-                  ))}
-                </div>
-                {!shownCatalog.length && <p className="muted">Không tìm thấy bộ phận.</p>}
-                <div className="section-heading">
-                  <h2>Mô hình của bạn</h2>
-                  <button disabled={!project || busy} onClick={() => assetInput.current?.click()}>
-                    + GLB
-                  </button>
-                </div>
-                <p className="muted small">Nhập GLB tối đa 32 MB. Tài nguyên được giữ trong dự án.</p>
-                {project?.assets.map((a) => (
-                  <div key={a.id} className="asset-row-group">
-                    <button
-                      className={`asset-row ${settings.assetId === a.id ? 'active' : ''}`}
-                      onClick={() =>
-                        setSettings((s) => ({ ...s, kind: 'model', assetId: a.id, tool: 'build' }))
-                      }
-                    >
-                      <span aria-hidden="true">▧</span>
-                      <span>
-                        {a.name}
-                        <small>
-                          {a.bytes < 10240
-                            ? `${Math.ceil(a.bytes / 1024)} KB`
-                            : `${(a.bytes / 1024 / 1024).toFixed(1)} MB`}
-                        </small>
-                      </span>
-                    </button>
-                    <button
-                      aria-label={`Gỡ mô hình ${a.name}`}
-                      title="Gỡ khỏi thư viện nếu không còn dùng"
-                      onClick={() => {
-                        if (
-                          [...project.objects, ...project.prefabs.flatMap((p) => p.objects)].some(
-                            (o) => o.assetId === a.id,
-                          )
-                        ) {
-                          setError(
-                            'Mô hình còn được dùng trong cảnh hoặc mẫu. Xóa các vật thể và mẫu đó trước khi gỡ tài nguyên.',
-                          );
-                          return;
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="asset-grid">
+                    {shownCatalog.map((c) => (
+                      <button
+                        key={c.kind}
+                        disabled={!project}
+                        className={`asset ${settings.kind === c.kind && settings.tool === 'build' ? 'chosen' : ''}`}
+                        onClick={() =>
+                          setSettings((s) => ({
+                            ...s,
+                            tool: 'build',
+                            kind: c.kind,
+                            assetId: undefined,
+                            color: c.color,
+                          }))
                         }
-                        setConfirm({
-                          title: 'Gỡ mô hình khỏi thư viện?',
-                          message:
-                            'Chỉ gỡ bản trong dự án. File GLB gốc trên máy không bị thay đổi. Có thể hoàn tác.',
-                          action: () => {
-                            commit((p) => {
-                              p.assets = p.assets.filter((asset) => asset.id !== a.id);
-                            });
-                            setSettings((s) => ({ ...s, tool: 'select', assetId: undefined }));
-                          },
-                        });
-                      }}
-                    >
-                      ✕
+                      >
+                        <span
+                          className={`asset-preview kind-${c.kind}`}
+                          style={{ '--asset-color': c.color } as React.CSSProperties}
+                          aria-hidden="true"
+                        >
+                          {c.glyph}
+                        </span>
+                        <span>{c.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                  {!shownCatalog.length && <p className="muted">Không tìm thấy bộ phận.</p>}
+                  <div className="section-heading">
+                    <h2>Mô hình của bạn</h2>
+                    <button disabled={!project || busy} onClick={() => assetInput.current?.click()}>
+                      + GLB
                     </button>
                   </div>
-                ))}
-                <div className="section-heading">
-                  <h2>Mẫu đã lưu</h2>
-                  <span>{project?.prefabs.length ?? 0}</span>
-                </div>
-                {project?.prefabs.length ? (
-                  project.prefabs.map((p) => (
-                    <div className="prefab-row" key={p.id}>
-                      <button onClick={() => placePrefab(p.id)}>
-                        {p.name}
-                        <small>{p.objects.length} bộ phận</small>
-                      </button>
-                      <button
-                        aria-label={`Xóa mẫu ${p.name}`}
-                        onClick={() =>
-                          setConfirm({
-                            title: 'Xóa mẫu?',
-                            message:
-                              'Các vật thể đã đặt trong cảnh vẫn giữ nguyên. Có thể hoàn tác thao tác này.',
-                            action: () =>
-                              commit((d) => {
-                                d.prefabs = d.prefabs.filter((f) => f.id !== p.id);
-                              }),
-                          })
-                        }
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  ))
-                ) : (
-                  <p className="muted small">Chọn một nhóm trong cảnh rồi lưu thành mẫu để dùng lại.</p>
-                )}
-              </div>
-            ) : (
-              <div className="panel-content">
-                <label className="search-field">
-                  <span>Tìm vật thể</span>
-                  <input
-                    value={objectQuery}
-                    onChange={(e) => setObjectQuery(e.target.value)}
-                    placeholder="Tên vật thể…"
-                  />
-                </label>
-                <button className="full" onClick={() => choose(project?.objects.map((o) => o.id) ?? [])}>
-                  Chọn tất cả vật thể khả dụng
-                </button>
-                <p className="muted small">
-                  Ctrl + bấm để chọn nhiều. Alt + bấm trong cảnh để chọn riêng một phần nhóm.
-                </p>
-                <div className="outliner">
-                  {shownObjects.length ? (
-                    shownObjects.map((o) => (
-                      <div key={o.id} className={`object-row ${selection.includes(o.id) ? 'selected' : ''}`}>
+                  <p className="muted small">
+                    GLB nhỏ hơn 1 GB. File lưu riêng trên máy; mô hình lớn cần nhiều RAM/GPU.
+                  </p>
+                  {project?.assets
+                    .filter((a) => a.type !== 'texture')
+                    .map((a) => (
+                      <div key={a.id} className="asset-row-group">
                         <button
-                          disabled={o.locked || !o.visible}
-                          onClick={(e) => choose([o.id], e.ctrlKey || e.shiftKey)}
-                          title={o.name}
+                          className={`asset-row ${settings.assetId === a.id ? 'active' : ''}`}
+                          onClick={() =>
+                            setSettings((s) => ({ ...s, kind: 'model', assetId: a.id, tool: 'build' }))
+                          }
                         >
-                          <span className="object-color" style={{ background: o.color }} />
-                          {o.name}
+                          <span aria-hidden="true">▧</span>
+                          <span>
+                            {a.name}
+                            <small>
+                              {a.bytes < 10240
+                                ? `${Math.ceil(a.bytes / 1024)} KB`
+                                : `${(a.bytes / 1024 / 1024).toFixed(1)} MB`}
+                            </small>
+                          </span>
                         </button>
                         <button
-                          aria-label={`${o.visible ? 'Ẩn' : 'Hiện'} ${o.name}`}
+                          aria-label={`Gỡ mô hình ${a.name}`}
+                          title="Gỡ khỏi thư viện nếu không còn dùng"
+                          onClick={() => {
+                            if (
+                              [...project.objects, ...project.prefabs.flatMap((p) => p.objects)].some(
+                                (o) => o.assetId === a.id,
+                              )
+                            ) {
+                              setError(
+                                'Mô hình còn được dùng trong cảnh hoặc mẫu. Xóa các vật thể và mẫu đó trước khi gỡ tài nguyên.',
+                              );
+                              return;
+                            }
+                            setConfirm({
+                              title: 'Gỡ mô hình khỏi thư viện?',
+                              message:
+                                'Chỉ gỡ bản trong dự án. File GLB gốc trên máy không bị thay đổi. Có thể hoàn tác.',
+                              action: () => {
+                                commit((p) => {
+                                  p.assets = p.assets.filter((asset) => asset.id !== a.id);
+                                });
+                                setSettings((s) => ({ ...s, tool: 'select', assetId: undefined }));
+                              },
+                            });
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                  <div className="section-heading">
+                    <h2>Mẫu đã lưu</h2>
+                    <span>{project?.prefabs.length ?? 0}</span>
+                  </div>
+                  {project?.prefabs.length ? (
+                    project.prefabs.map((p) => (
+                      <div className="prefab-row" key={p.id}>
+                        <button onClick={() => placePrefab(p.id)}>
+                          {p.name}
+                          <small>{p.objects.length} bộ phận</small>
+                        </button>
+                        <button
+                          aria-label={`Xóa mẫu ${p.name}`}
                           onClick={() =>
-                            commit((p) => {
-                              p.objects.find((n) => n.id === o.id)!.visible = !o.visible;
+                            setConfirm({
+                              title: 'Xóa mẫu?',
+                              message:
+                                'Các vật thể đã đặt trong cảnh vẫn giữ nguyên. Có thể hoàn tác thao tác này.',
+                              action: () =>
+                                commit((d) => {
+                                  d.prefabs = d.prefabs.filter((f) => f.id !== p.id);
+                                }),
                             })
                           }
                         >
-                          {o.visible ? '◉' : '○'}
-                        </button>
-                        <button
-                          aria-label={`${o.locked ? 'Mở khóa' : 'Khóa'} ${o.name}`}
-                          onClick={() =>
-                            commit((p) => {
-                              p.objects.find((n) => n.id === o.id)!.locked = !o.locked;
-                            })
-                          }
-                        >
-                          {o.locked ? '▣' : '□'}
+                          ✕
                         </button>
                       </div>
                     ))
                   ) : (
-                    <p className="muted">Chưa có vật thể phù hợp.</p>
+                    <p className="muted small">Chọn một nhóm trong cảnh rồi lưu thành mẫu để dùng lại.</p>
                   )}
                 </div>
-              </div>
-            )}
-          </aside>
-          <main className="viewport-shell" aria-label="Xưởng dựng bản đồ">
-            <h1 className="sr-only">Game-3DMaker, xưởng dựng bản đồ 3D</h1>
-            <div className="viewport-top">
-              <div className="view-switch" aria-label="Góc nhìn">
-                {(
-                  [
-                    ['orbit', 'Phối cảnh'],
-                    ['top', 'Từ trên'],
-                    ['fly', 'Bay'],
-                  ] as const
-                ).map(([v, label]) => (
-                  <button
-                    key={v}
-                    disabled={settings.walk}
-                    className={settings.view === v ? 'active' : ''}
-                    onClick={() => {
-                      world.current?.view(v);
-                      setSettings((s) => ({ ...s, view: v }));
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <div className="scene-actions">
-                <button disabled={!project} onClick={() => world.current?.focus(true)}>
-                  Toàn cảnh
-                </button>
-                <button
-                  className="primary"
-                  disabled={!project || !worldReady}
-                  onClick={() => setSettings((s) => ({ ...s, walk: !s.walk }))}
-                >
-                  {settings.walk ? 'Về xưởng' : '▶ Đi thử'}
-                </button>
-              </div>
-            </div>
-            <button
-              className="inspector-toggle"
-              aria-expanded={inspectorOpen}
-              onClick={() => setInspectorOpen((v) => !v)}
-            >
-              {inspectorOpen ? 'Đóng thuộc tính' : 'Thuộc tính'}
-            </button>
-            <div
-              className="viewport"
-              ref={host}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault();
-                const file = e.dataTransfer.files[0];
-                if (file && project) void importAsset(file);
-              }}
-            />
-            {gpuError && (
-              <div className="viewport-error" role="alert">
-                <strong>Không mở được cảnh 3D</strong>
-                <p>{gpuError}</p>
-              </div>
-            )}
-            {!project && !panel && (
-              <div className="welcome-hint">
-                <h2>Bắt đầu một bản đồ của riêng bạn</h2>
-                <button className="primary" onClick={() => setPanel('projects')}>
-                  Mở danh sách dự án
-                </button>
-              </div>
-            )}
-            {settings.walk ? (
-              <div className="walk-hud">
-                <strong>Đang đi thử</strong>
-                <span>W A S D: đi · Shift: chạy · Space: nhảy · Esc: về xưởng</span>
-                <button onClick={() => world.current?.resetSpawn()}>Về điểm bắt đầu</button>
-                <span className="muted small">Bấm vào cảnh để giữ chuột, hoặc kéo chuột để nhìn.</span>
-                <span className="small" aria-label="Vị trí người chơi">
-                  X {walkPosition[0].toFixed(1)} · Y {walkPosition[1].toFixed(1)} · Z{' '}
-                  {walkPosition[2].toFixed(1)}
-                </span>
-              </div>
-            ) : (
-              <>
-                <div className="tool-rail" role="toolbar" aria-label="Công cụ dựng cảnh">
-                  {toolList.map((t) => (
-                    <button
-                      key={t.id}
-                      disabled={!project}
-                      aria-label={`${t.label} (${t.key})`}
-                      aria-pressed={settings.tool === t.id}
-                      title={`${t.label} (${t.key})`}
-                      onClick={() => tool(t.id)}
-                    >
-                      <span aria-hidden="true">{t.icon}</span>
-                      <small>{t.label}</small>
-                    </button>
-                  ))}
-                  <div className="rail-divider" />
-                  <button
-                    aria-label="Hoàn tác"
-                    title="Hoàn tác (Ctrl Z)"
-                    disabled={!history.current.canUndo}
-                    onClick={() => undo()}
-                  >
-                    <span>↶</span>
-                  </button>
-                  <button
-                    aria-label="Làm lại"
-                    title="Làm lại (Ctrl Shift Z)"
-                    disabled={!history.current.canRedo}
-                    onClick={() => undo(true)}
-                  >
-                    <span>↷</span>
-                  </button>
-                </div>
-                <div className="canvas-hint">
-                  {settings.tool === 'build'
-                    ? `Đang đặt ${catalog.find((c) => c.kind === settings.kind)?.name ?? 'mô hình'} · Bấm/kéo để xây · [ ] xoay`
-                    : settings.tool === 'erase'
-                      ? 'Bấm/kéo qua vật thể để xóa · Ctrl Z hoàn tác'
-                      : settings.tool === 'spawn'
-                        ? 'Bấm lên mặt nền để đặt điểm bắt đầu đi thử'
-                        : settings.tool === 'sample'
-                          ? 'Bấm vật thể để lấy mẫu loại khối và vật liệu'
-                          : settings.view === 'fly'
-                            ? 'W A S D: bay · Q E: lên/xuống · Shift: nhanh'
-                            : settings.tool === 'select'
-                              ? 'Kéo: xoay góc nhìn · Chuột phải: kéo cảnh · Cuộn: zoom · Shift kéo: chọn vùng'
-                              : 'Kéo tay nắm để chỉnh · F: nhìn gần vật thể'}
-                </div>
-              </>
-            )}
-            <div className="viewport-bottom">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={settings.grid}
-                  onChange={(e) => setSettings((s) => ({ ...s, grid: e.target.checked }))}
-                />
-                Lưới
-              </label>
-              <label>
-                Bám lưới{' '}
-                <select
-                  value={settings.snap}
-                  onChange={(e) => setSettings((s) => ({ ...s, snap: Number(e.target.value) }))}
-                >
-                  <option value={0}>Tự do</option>
-                  {[0.25, 0.5, 1, 2].map((n) => (
-                    <option key={n} value={n}>
-                      {n} m
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <span>{selected.length ? `${selected.length} đã chọn` : 'Chưa chọn vật thể'}</span>
-              <span className="scene-size">
-                {project?.environment.size ?? 40} × {project?.environment.size ?? 40} m
-              </span>
-            </div>
-          </main>
-          <aside className="inspector" aria-label="Thuộc tính">
-            <div className="inspector-heading">
-              <h2>
-                {settings.tool === 'build' ? 'Đặt bộ phận' : first ? 'Vật thể đang chọn' : 'Thiết lập bản đồ'}
-              </h2>
-              <span>{first ? `${selected.length} mục` : 'Mét (m)'}</span>
-            </div>
-            <div className="panel-content">
-              {settings.tool === 'build' ? (
-                <>
-                  <div className="selected-part">
-                    <span aria-hidden="true">
-                      {catalog.find((c) => c.kind === settings.kind)?.glyph ?? '▧'}
-                    </span>
-                    <div>
-                      <strong>
-                        {catalog.find((c) => c.kind === settings.kind)?.name ??
-                          project?.assets.find((a) => a.id === settings.assetId)?.name ??
-                          'Mô hình'}
-                      </strong>
-                      <small>Bấm xuống nền để đặt</small>
-                    </div>
-                  </div>
-                  <NumberField
-                    label="Góc đặt (độ)"
-                    value={(settings.rotation * 180) / Math.PI}
-                    min={-3600}
-                    max={3600}
-                    step={15}
-                    onChange={(v) => setSettings((s) => ({ ...s, rotation: (v * Math.PI) / 180 }))}
-                  />
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={settings.buildHeight !== null}
-                      onChange={(e) =>
-                        setSettings((s) => ({ ...s, buildHeight: e.target.checked ? 0 : null }))
-                      }
-                    />
-                    Xây trên một độ cao cố định
-                  </label>
-                  {settings.buildHeight !== null && (
-                    <NumberField
-                      label="Độ cao xây"
-                      value={settings.buildHeight}
-                      min={0}
-                      max={500}
-                      onChange={(v) => setSettings((s) => ({ ...s, buildHeight: v }))}
-                    />
-                  )}
-                  <button
-                    className="full"
-                    disabled={!project || (settings.kind === 'model' && !settings.assetId)}
-                    onClick={addAtCenter}
-                  >
-                    Đặt tại tâm bản đồ
-                  </button>
-                </>
-              ) : first ? (
-                <>
-                  <label className="field">
-                    Tên vật thể
-                    <input
-                      key={first.id + first.name}
-                      defaultValue={first.name}
-                      maxLength={100}
-                      onBlur={(e) => {
-                        if (e.target.value.trim() && e.target.value !== first.name)
-                          patchSelected({ name: e.target.value.trim() });
-                      }}
-                    />
-                  </label>
-                  <div className="section-heading">
-                    <h3>Vị trí</h3>
-                    <button onClick={() => world.current?.focus()}>
-                      Nhìn gần <kbd>F</kbd>
-                    </button>
-                  </div>
-                  {selected.length === 2 && (
-                    <p className="muted small">
-                      Khoảng cách giữa hai gốc:{' '}
-                      {Math.hypot(...selected[0].position.map((n, i) => n - selected[1].position[i])).toFixed(
-                        2,
-                      )}{' '}
-                      m
-                    </p>
-                  )}
-                  <div className="xyz">
-                    {(['X', 'Y', 'Z'] as const).map((axis, i) => (
-                      <NumberField
-                        key={axis}
-                        label={axis}
-                        value={first.position[i]}
-                        onChange={(v) =>
-                          commit((p) => {
-                            const delta = v - first.position[i];
-                            for (const o of p.objects)
-                              if (selection.includes(o.id) && !o.locked) o.position[i] += delta;
-                          })
-                        }
-                      />
-                    ))}
-                  </div>
-                  <h3>Góc xoay (độ)</h3>
-                  <div className="xyz">
-                    {(['X', 'Y', 'Z'] as const).map((axis, i) => (
-                      <NumberField
-                        key={axis}
-                        label={`Xoay ${axis}`}
-                        value={(first.rotation[i] * 180) / Math.PI}
-                        min={-3600}
-                        max={3600}
-                        step={15}
-                        onChange={(v) => {
-                          const r = [...first.rotation] as Vec3;
-                          r[i] = (v * Math.PI) / 180;
-                          patchSelected({ rotation: r });
-                        }}
-                      />
-                    ))}
-                  </div>
-                  <h3>Kích thước / tỷ lệ</h3>
-                  <div className="xyz">
-                    {(['Rộng', 'Cao', 'Sâu'] as const).map((axis, i) => (
-                      <NumberField
-                        key={axis}
-                        label={axis}
-                        value={first.scale[i]}
-                        min={0.01}
-                        max={500}
-                        onChange={(v) => {
-                          const s = [...first.scale] as Vec3;
-                          s[i] = v;
-                          patchSelected({ scale: s });
-                        }}
-                      />
-                    ))}
-                  </div>
-                  {first.kind === 'model' && (
-                    <p className="muted small">
-                      GLB được chuẩn hóa cạnh dài nhất về 1 m. Kích thước ở đây là hệ số nhân theo trục.
-                    </p>
-                  )}
-                  <div className="button-grid">
-                    <button onClick={duplicate}>Nhân bản</button>
-                    <button onClick={() => setPanel('repeat')}>Lặp thành hàng</button>
-                    <button disabled={selected.length < 2} onClick={group}>
-                      Gom nhóm
-                    </button>
-                    <button
-                      disabled={!selected.some((o) => o.group)}
-                      onClick={() => patchSelected({ group: null })}
-                    >
-                      Tách nhóm
-                    </button>
-                    <button
-                      onClick={() =>
-                        commit((p) => {
-                          for (const o of p.objects)
-                            if (selection.includes(o.id) && !o.locked) o.position[1] = 0;
-                        })
-                      }
-                    >
-                      Đặt xuống nền
-                    </button>
-                    <button
-                      disabled={selected.length < 2}
-                      onClick={() =>
-                        commit((p) => {
-                          for (const o of p.objects)
-                            if (selection.includes(o.id) && !o.locked) o.position[2] = first.position[2];
-                        })
-                      }
-                    >
-                      Căn hàng theo Z
-                    </button>
-                  </div>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={first.collision}
-                      onChange={(e) => patchSelected({ collision: e.target.checked })}
-                    />
-                    Có va chạm khi đi thử
-                  </label>
-                  <div className="button-grid">
-                    <button
-                      onClick={() => {
-                        patchSelected({ visible: false });
-                        setSelection([]);
-                        setLibraryTab('objects');
-                      }}
-                    >
-                      Ẩn vật thể
-                    </button>
-                    <button
-                      onClick={() => {
-                        patchSelected({ locked: true });
-                        setSelection([]);
-                        setLibraryTab('objects');
-                      }}
-                    >
-                      Khóa vật thể
-                    </button>
-                  </div>
-                </>
               ) : (
-                <p className="muted intro">
-                  Chọn một bộ phận ở thư viện để xây, hoặc bấm vào vật thể để chỉnh sửa.
-                </p>
-              )}
-              {first?.kind === 'model' && settings.tool !== 'build' && (
-                <>
-                  <h3>Bộ phận mô hình GLB</h3>
-                  <p className="muted small">
-                    Tách các phần hình học có sẵn để sửa từng phần bằng công cụ của xưởng. Không tự phân chia
-                    mô hình liền khối.
-                  </p>
-                  <button
-                    className="full"
-                    disabled={busy || !!first.modelPart}
-                    onClick={() => void splitModel()}
-                  >
-                    Tách các bộ phận có sẵn
-                  </button>
-                  <label className="check">
+                <div className="panel-content">
+                  <label className="search-field">
+                    <span>Tìm vật thể</span>
                     <input
-                      type="checkbox"
-                      checked={first.tint ?? false}
-                      onChange={(e) => patchSelected({ tint: e.target.checked, material: 'plain' })}
+                      value={objectQuery}
+                      onChange={(e) => setObjectQuery(e.target.value)}
+                      placeholder="Tên vật thể…"
                     />
-                    Thay màu gốc của mô hình
                   </label>
-                </>
+                  <button className="full" onClick={() => choose(project?.objects.map((o) => o.id) ?? [])}>
+                    Chọn tất cả vật thể khả dụng
+                  </button>
+                  <p className="muted small">
+                    Ctrl + bấm để chọn nhiều. Alt + bấm trong cảnh để chọn riêng một phần nhóm.
+                  </p>
+                  <div className="outliner">
+                    {shownObjects.length ? (
+                      shownObjects.map((o) => (
+                        <div
+                          key={o.id}
+                          className={`object-row ${selection.includes(o.id) ? 'selected' : ''}`}
+                        >
+                          <button
+                            disabled={o.locked || !o.visible}
+                            onClick={(e) => choose([o.id], e.ctrlKey || e.shiftKey)}
+                            title={o.name}
+                          >
+                            <span className="object-color" style={{ background: o.color }} />
+                            {o.name}
+                          </button>
+                          <button
+                            aria-label={`${o.visible ? 'Ẩn' : 'Hiện'} ${o.name}`}
+                            onClick={() =>
+                              commit((p) => {
+                                p.objects.find((n) => n.id === o.id)!.visible = !o.visible;
+                              })
+                            }
+                          >
+                            {o.visible ? '◉' : '○'}
+                          </button>
+                          <button
+                            aria-label={`${o.locked ? 'Mở khóa' : 'Khóa'} ${o.name}`}
+                            onClick={() =>
+                              commit((p) => {
+                                p.objects.find((n) => n.id === o.id)!.locked = !o.locked;
+                              })
+                            }
+                          >
+                            {o.locked ? '▣' : '□'}
+                          </button>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="muted">Chưa có vật thể phù hợp.</p>
+                    )}
+                  </div>
+                </div>
               )}
-              {(first || settings.tool === 'build') && (
+            </aside>
+            <main className="viewport-shell" aria-label="Xưởng dựng bản đồ">
+              <h1 className="sr-only">Game-3DMaker, xưởng dựng bản đồ 3D</h1>
+              <div className="viewport-top">
+                <div className="view-switch" aria-label="Góc nhìn">
+                  {(
+                    [
+                      ['orbit', 'Phối cảnh'],
+                      ['top', 'Từ trên'],
+                      ['fly', 'Bay'],
+                    ] as const
+                  ).map(([v, label]) => (
+                    <button
+                      key={v}
+                      disabled={settings.walk}
+                      className={settings.view === v ? 'active' : ''}
+                      onClick={() => {
+                        world.current?.view(v);
+                        setSettings((s) => ({ ...s, view: v }));
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="scene-actions">
+                  <button disabled={!project || modelsLoading > 0} onClick={() => world.current?.focus(true)}>
+                    Toàn cảnh
+                  </button>
+                  <button
+                    className="primary"
+                    disabled={!project || !worldReady}
+                    onClick={() => setSettings((s) => ({ ...s, walk: !s.walk }))}
+                  >
+                    {settings.walk ? 'Về xưởng' : '▶ Đi thử'}
+                  </button>
+                </div>
+              </div>
+              <button
+                className="inspector-toggle"
+                aria-expanded={inspectorOpen}
+                onClick={() => setInspectorOpen((v) => !v)}
+              >
+                {inspectorOpen ? 'Đóng thuộc tính' : 'Thuộc tính'}
+              </button>
+              {modelsLoading > 0 && (
+                <div className="scene-loading" role="status">
+                  Đang nạp {modelsLoading} mô hình…
+                </div>
+              )}
+              <div
+                className="viewport"
+                ref={host}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const file = e.dataTransfer.files[0];
+                  if (file && project) void importAsset(file);
+                }}
+              />
+              {gpuError && (
+                <div className="viewport-error" role="alert">
+                  <strong>Không mở được cảnh 3D</strong>
+                  <p>{gpuError}</p>
+                </div>
+              )}
+              {!project && !panel && (
+                <div className="welcome-hint">
+                  <h2>Bắt đầu một bản đồ của riêng bạn</h2>
+                  <button className="primary" onClick={() => setPanel('projects')}>
+                    Mở danh sách dự án
+                  </button>
+                </div>
+              )}
+              {settings.walk ? (
+                <div className="walk-hud">
+                  <strong>Đang đi thử</strong>
+                  <span>W A S D: đi · Shift: chạy · Space: nhảy · Esc: về xưởng</span>
+                  <button onClick={() => world.current?.resetSpawn()}>Về điểm bắt đầu</button>
+                  <span className="muted small">Bấm vào cảnh để giữ chuột, hoặc kéo chuột để nhìn.</span>
+                  <span className="small" aria-label="Vị trí người chơi">
+                    X {walkPosition[0].toFixed(1)} · Y {walkPosition[1].toFixed(1)} · Z{' '}
+                    {walkPosition[2].toFixed(1)}
+                  </span>
+                </div>
+              ) : (
                 <>
-                  <h3>Vật liệu</h3>
-                  <div className="material-grid">
-                    {materials.map((m) => (
+                  <div className="tool-rail" role="toolbar" aria-label="Công cụ dựng cảnh">
+                    {toolList.map((t) => (
                       <button
-                        key={m.id}
-                        title={m.name}
-                        aria-label={`Vật liệu ${m.name}`}
-                        aria-pressed={
-                          (settings.tool === 'build' ? settings.material : first?.material) === m.id
-                        }
-                        style={{ '--material': m.color } as React.CSSProperties}
-                        onClick={() => {
-                          if (settings.tool === 'build')
-                            setSettings((s) => ({ ...s, material: m.id, color: m.color }));
-                          else
-                            patchSelected({ material: m.id, color: m.color, tint: first?.kind === 'model' });
-                        }}
+                        key={t.id}
+                        disabled={!project}
+                        aria-label={`${t.label} (${t.key})`}
+                        aria-pressed={settings.tool === t.id}
+                        title={`${t.label} (${t.key})`}
+                        onClick={() => tool(t.id)}
                       >
-                        <span />
-                        <small>{m.name}</small>
+                        <span aria-hidden="true">{t.icon}</span>
+                        <small>{t.label}</small>
                       </button>
                     ))}
-                  </div>
-                  <label className="color-field">
-                    Màu vật thể
-                    <input
-                      type="color"
-                      value={settings.tool === 'build' ? settings.color : (first?.color ?? '#aaaaaa')}
-                      onChange={(e) => {
-                        if (settings.tool === 'build') setSettings((s) => ({ ...s, color: e.target.value }));
-                        else patchSelected({ color: e.target.value, tint: first?.kind === 'model' });
-                      }}
-                    />
-                  </label>
-                  <div className="color-history">
-                    {favoriteColors.map((c) => (
-                      <button
-                        key={c}
-                        title={`Dùng màu ${c}`}
-                        aria-label={`Dùng màu ${c}`}
-                        style={{ background: c }}
-                        onClick={() =>
-                          settings.tool === 'build'
-                            ? setSettings((s) => ({ ...s, color: c }))
-                            : patchSelected({ color: c, tint: first?.kind === 'model' })
-                        }
-                      />
-                    ))}
+                    <div className="rail-divider" />
                     <button
-                      onClick={() => {
-                        const c = settings.tool === 'build' ? settings.color : first?.color;
-                        if (c)
-                          commit((p) => {
-                            p.palette = [...new Set([c, ...(p.palette ?? [])])].slice(0, 8);
-                          });
-                      }}
+                      aria-label="Hoàn tác"
+                      title="Hoàn tác (Ctrl Z)"
+                      disabled={!history.current.canUndo}
+                      onClick={() => undo()}
                     >
-                      + Lưu màu
+                      <span>↶</span>
+                    </button>
+                    <button
+                      aria-label="Làm lại"
+                      title="Làm lại (Ctrl Shift Z)"
+                      disabled={!history.current.canRedo}
+                      onClick={() => undo(true)}
+                    >
+                      <span>↷</span>
                     </button>
                   </div>
-                  {first && settings.tool !== 'build' && (
-                    <>
-                      <NumberField
-                        label="Độ nhám"
-                        value={first.roughness}
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        onChange={(roughness) => patchSelected({ roughness })}
-                      />
-                      <NumberField
-                        label="Độ kim loại"
-                        value={first.metalness}
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        onChange={(metalness) => patchSelected({ metalness })}
-                      />
-                    </>
-                  )}
+                  <div className="canvas-hint">
+                    {settings.tool === 'build'
+                      ? `Đang đặt ${catalog.find((c) => c.kind === settings.kind)?.name ?? 'mô hình'} · Bấm/kéo để xây · [ ] xoay`
+                      : settings.tool === 'erase'
+                        ? 'Bấm/kéo qua vật thể để xóa · Ctrl Z hoàn tác'
+                        : settings.tool === 'spawn'
+                          ? 'Bấm lên mặt nền để đặt điểm bắt đầu đi thử'
+                          : settings.tool === 'sample'
+                            ? 'Bấm vật thể để lấy mẫu loại khối và vật liệu'
+                            : settings.view === 'fly'
+                              ? 'W A S D: bay · Q E: lên/xuống · Shift: nhanh'
+                              : settings.tool === 'select'
+                                ? 'Kéo: xoay góc nhìn · Chuột phải: kéo cảnh · Cuộn: zoom · Shift kéo: chọn vùng'
+                                : 'Kéo tay nắm để chỉnh · F: nhìn gần vật thể'}
+                  </div>
                 </>
               )}
-              {first && settings.tool !== 'build' && (
-                <>
-                  <h3>Lưu thành mẫu</h3>
-                  <label className="field">
-                    Tên mẫu
-                    <input
-                      value={prefabName}
-                      maxLength={100}
-                      onChange={(e) => setPrefabName(e.target.value)}
-                    />
-                  </label>
-                  <button className="full" onClick={savePrefab}>
-                    Lưu {selected.length} bộ phận vào thư viện
-                  </button>
-                  <button className="danger full" onClick={() => removeObjects()}>
-                    Xóa vật thể đã chọn
-                  </button>
-                </>
-              )}
-              <details className="environment" open={!first && settings.tool !== 'build'}>
-                <summary>Không gian & hiển thị</summary>
-                {project && (
-                  <>
-                    <NumberField
-                      label="Cạnh bản đồ (m)"
-                      value={project.environment.size}
-                      min={10}
-                      max={500}
-                      step={10}
-                      onChange={(size) =>
-                        commit((p) => {
-                          p.environment.size = size;
-                        })
-                      }
-                    />
-                    <label className="color-field">
-                      Màu nền đất
-                      <input
-                        type="color"
-                        value={project.environment.ground}
-                        onChange={(e) =>
-                          commit((p) => {
-                            p.environment.ground = e.target.value;
-                          })
-                        }
-                      />
-                    </label>
-                    <label className="color-field">
-                      Màu trời
-                      <input
-                        type="color"
-                        value={project.environment.sky}
-                        onChange={(e) =>
-                          commit((p) => {
-                            p.environment.sky = e.target.value;
-                          })
-                        }
-                      />
-                    </label>
-                    <NumberField
-                      label="Hướng nắng (độ)"
-                      value={project.environment.sun}
-                      min={0}
-                      max={360}
-                      step={15}
-                      onChange={(sun) =>
-                        commit((p) => {
-                          p.environment.sun = sun;
-                        })
-                      }
-                    />
-                    <label className="check">
-                      <input
-                        type="checkbox"
-                        checked={project.environment.shadows}
-                        onChange={(e) =>
-                          commit((p) => {
-                            p.environment.shadows = e.target.checked;
-                          })
-                        }
-                      />
-                      Bóng đổ
-                    </label>
-                    <label className="check">
-                      <input
-                        type="checkbox"
-                        checked={settings.collisionHelpers}
-                        onChange={(e) => setSettings((s) => ({ ...s, collisionHelpers: e.target.checked }))}
-                      />
-                      Hiện khối va chạm
-                    </label>
-                    <button className="full" onClick={() => tool('spawn')}>
-                      Đặt điểm bắt đầu đi thử
-                    </button>
-                    <p className="muted small">
-                      Điểm bắt đầu: {project.spawn.map((n) => n.toFixed(1)).join(' / ')}
-                    </p>
-                  </>
-                )}
-                <label className="field">
-                  Chất lượng
+              <div className="viewport-bottom">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={settings.grid}
+                    onChange={(e) => setSettings((s) => ({ ...s, grid: e.target.checked }))}
+                  />
+                  Lưới
+                </label>
+                <label>
+                  Bám lưới{' '}
                   <select
-                    value={settings.quality}
-                    onChange={(e) =>
-                      setSettings((s) => ({ ...s, quality: e.target.value as 'low' | 'high' }))
-                    }
+                    value={settings.snap}
+                    onChange={(e) => setSettings((s) => ({ ...s, snap: Number(e.target.value) }))}
                   >
-                    <option value="high">Cao</option>
-                    <option value="low">Nhẹ máy</option>
+                    <option value={0}>Tự do</option>
+                    {[0.25, 0.5, 1, 2].map((n) => (
+                      <option key={n} value={n}>
+                        {n} m
+                      </option>
+                    ))}
                   </select>
                 </label>
-                <NumberField
-                  label="Tốc độ bay"
-                  value={settings.flySpeed}
-                  min={1}
-                  max={40}
-                  step={1}
-                  onChange={(flySpeed) => setSettings((s) => ({ ...s, flySpeed }))}
-                />
-              </details>
-              {project && (
-                <button className="full" disabled={busy} onClick={() => void showBackups()}>
-                  Bản lưu dự phòng
-                </button>
-              )}
-            </div>
-          </aside>
-        </div>
-        <footer className="app-footer">
-          <span>Lưu trên máy của bạn</span>
-          <span>{busy ? 'Đang xử lý tài nguyên…' : 'Chỉ chạy localhost · Không cần tài khoản'}</span>
-          <button onClick={() => setPanel('help')}>Phím tắt & hướng dẫn</button>
-        </footer>
-        {notice && (
-          <div className="toast" role="status">
-            {notice}
-            <button aria-label="Đóng thông báo" onClick={() => setNotice('')}>
-              ✕
-            </button>
-          </div>
-        )}
-        {error && (
-          <div className="error-banner" role="alert">
-            <span>{error}</span>
-            <button onClick={() => setError('')}>Đóng lỗi</button>
-            {dirty && <button onClick={exportProject}>Xuất để giữ thay đổi</button>}
-          </div>
-        )}
-        <input
-          className="sr-only"
-          type="file"
-          accept=".glb"
-          ref={assetInput}
-          aria-label="Chọn mô hình GLB"
-          tabIndex={-1}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            e.target.value = '';
-            if (f) void importAsset(f);
-          }}
-        />
-        <input
-          className="sr-only"
-          type="file"
-          accept=".json,.3dmaker"
-          ref={projectInput}
-          aria-label="Chọn gói dự án"
-          tabIndex={-1}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            e.target.value = '';
-            if (f) void importProject(f);
-          }}
-        />
-        {panel === 'projects' && (
-          <Modal wide title="Bản đồ của bạn" onClose={() => setPanel(null)}>
-            <p className="muted">
-              Một khoảng đất trống, hoặc một khu vườn để bắt đầu. Mọi thay đổi được lưu ngay trên máy này.
-            </p>
-            <div className="project-actions">
-              <button className="primary" disabled={busy} onClick={() => setPanel('new')}>
-                + Tạo bản đồ
-              </button>
-              <button disabled={busy} onClick={() => void create(true)}>
-                Mở cảnh mẫu
-              </button>
-              <button disabled={busy} onClick={() => projectInput.current?.click()}>
-                Nhập gói dự án
-              </button>
-              <button disabled={loading} onClick={() => void listProjects()}>
-                Làm mới
-              </button>
-            </div>
-            <div className="project-list">
-              {loading ? (
-                <p role="status">Đang đọc dự án trên máy…</p>
-              ) : summaries.length ? (
-                summaries.map((p) => (
-                  <article key={p.id} className="project-card">
-                    <div className="project-art">
-                      {p.thumbnail ? (
-                        <img src={p.thumbnail} width={105} height={85} alt={`Ảnh xem trước ${p.name}`} />
-                      ) : (
-                        <span className="small muted">Chưa có ảnh</span>
-                      )}
-                      <small>{p.count} vật thể</small>
-                    </div>
-                    <div>
-                      <h3>{p.name}</h3>
-                      <p>
-                        {p.updatedAt
-                          ? new Date(p.updatedAt).toLocaleString('vi-VN')
-                          : 'Kiểm tra thư mục data/backups'}
-                      </p>
-                      <div className="project-card-actions">
-                        <button
-                          className="primary"
-                          disabled={busy || p.corrupt}
-                          onClick={() => void openId(p.id)}
-                        >
-                          Mở bản đồ
-                        </button>
-                        <button disabled={busy || p.corrupt} onClick={() => void copyProject(p)}>
-                          Tạo bản sao
-                        </button>
-                        <button disabled={busy} onClick={() => void showBackups(p.id)}>
-                          Bản dự phòng
-                        </button>
-                        <button
-                          className="danger"
-                          disabled={busy}
-                          onClick={() =>
-                            setConfirm({
-                              title: 'Chuyển dự án vào thùng lưu?',
-                              message:
-                                'Dự án sẽ chuyển vào data/trash trên máy, không xóa vĩnh viễn. Nếu đang mở, thay đổi hiện tại sẽ được lưu trước.',
-                              action: () => {
-                                void (async () => {
-                                  if (projectRef.current?.id === p.id && !(await save())) return;
-                                  try {
-                                    await api(`/api/projects/${p.id}`, { method: 'DELETE' });
-                                    if (projectRef.current?.id === p.id) {
-                                      projectRef.current = null;
-                                      setProject(null);
-                                      setSelection([]);
-                                      changed.current = saved.current;
-                                      setDirty(false);
-                                      setStatus('Chưa mở dự án');
-                                      setSettings((s) => ({ ...s, walk: false, tool: 'select' }));
-                                    }
-                                    await listProjects();
-                                  } catch (e) {
-                                    setError((e as Error).message);
-                                  }
-                                })();
-                              },
-                            })
-                          }
-                        >
-                          Cất vào thùng lưu
-                        </button>
+                <span>{selected.length ? `${selected.length} đã chọn` : 'Chưa chọn vật thể'}</span>
+                <span className="scene-size">
+                  {project?.environment.size ?? 40} × {project?.environment.size ?? 40} m
+                </span>
+              </div>
+            </main>
+            <aside className="inspector" aria-label="Thuộc tính">
+              <div className="inspector-heading">
+                <h2>
+                  {settings.tool === 'build'
+                    ? 'Đặt bộ phận'
+                    : first
+                      ? 'Vật thể đang chọn'
+                      : 'Thiết lập bản đồ'}
+                </h2>
+                <span>{first ? `${selected.length} mục` : 'Mét (m)'}</span>
+              </div>
+              <div className="panel-content">
+                {settings.tool === 'build' ? (
+                  <>
+                    <div className="selected-part">
+                      <span aria-hidden="true">
+                        {catalog.find((c) => c.kind === settings.kind)?.glyph ?? '▧'}
+                      </span>
+                      <div>
+                        <strong>
+                          {catalog.find((c) => c.kind === settings.kind)?.name ??
+                            project?.assets.find((a) => a.id === settings.assetId)?.name ??
+                            'Mô hình'}
+                        </strong>
+                        <small>Bấm xuống nền để đặt</small>
                       </div>
                     </div>
-                  </article>
-                ))
-              ) : (
-                <div className="empty-projects">
-                  <strong>Chưa có bản đồ nào.</strong>
-                  <p>Tạo bản đồ trống hoặc mở cảnh mẫu để thử xây ngay.</p>
-                </div>
-              )}
-            </div>
-            <p className="small muted">
-              File bản đồ: data/*.json · Tài nguyên mô hình được nhúng trong từng dự án.
-            </p>
-          </Modal>
-        )}
-        {panel === 'new' && (
-          <Modal title="Tạo bản đồ mới" onClose={() => setPanel('projects')}>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void create();
-              }}
-            >
-              <label className="field">
-                Tên bản đồ
-                <input
-                  autoFocus
-                  value={newName}
-                  maxLength={100}
-                  required
-                  onChange={(e) => setNewName(e.target.value)}
-                />
-              </label>
-              <NumberField
-                label="Cạnh nền (m)"
-                value={newSize}
-                min={10}
-                max={500}
-                step={10}
-                onChange={setNewSize}
-              />
-              <p className="muted">
-                Có thể đổi kích thước nền trong lúc xây. Bắt đầu từ 40 m sẽ dễ quan sát hơn.
-              </p>
-              <button className="primary full" disabled={busy || !newName.trim()} type="submit">
-                Tạo và mở bản đồ
-              </button>
-            </form>
-          </Modal>
-        )}
-        {panel === 'help' && (
-          <Modal wide title="Xây bản đồ theo cách của bạn" onClose={() => setPanel(null)}>
-            <div className="help-layout">
-              <section>
-                <h3>Bắt đầu</h3>
-                <ol>
-                  <li>Chọn một bộ phận từ thư viện bên trái.</li>
-                  <li>Rê chuột để xem bản mờ, bấm xuống nền để đặt. Giữ và kéo để đặt liên tiếp.</li>
-                  <li>Dùng Chọn, rồi Di chuyển / Xoay / Kích thước để chỉnh.</li>
-                  <li>Chọn Đi thử để đi bộ trong bản đồ. Bấm vào cảnh để giữ chuột.</li>
-                </ol>
-                <h3>Mẹo tiết kiệm thao tác</h3>
-                <p>
-                  Ctrl + bấm chọn nhiều; Shift + kéo chọn vùng. Nhóm được chọn cùng nhau; Alt + bấm chọn riêng
-                  một phần.
-                </p>
-                <p>
-                  Lặp thành hàng tạo nhiều bản sao theo khoảng cách bạn nhập. Lưu thành mẫu để tái sử dụng cả
-                  công trình.
-                </p>
-                <p>
-                  Khóa hoặc ẩn vật thể trong danh sách bên trái. Bật Hiện khối va chạm để xem những vùng chặn
-                  người đi.
-                </p>
-              </section>
-              <section>
-                <h3>Phím tắt</h3>
-                <dl className="shortcuts">
-                  {[
-                    ['V / B', 'Chọn / Xây'],
-                    ['G / R / T', 'Di chuyển / Xoay / Kích thước'],
-                    ['X / I / P', 'Xóa / Lấy mẫu / Điểm bắt đầu'],
-                    ['[ / ]', 'Xoay bộ phận trước khi đặt'],
-                    ['F', 'Nhìn gần vật thể'],
-                    ['Ctrl D / Ctrl G', 'Nhân bản / Gom nhóm'],
-                    ['Ctrl A', 'Chọn tất cả vật thể khả dụng'],
-                    ['Ctrl Z / Ctrl Shift Z', 'Hoàn tác / Làm lại'],
-                    ['Ctrl S', 'Lưu dự án'],
-                    ['Delete', 'Xóa vật thể đang chọn'],
-                    ['W A S D / Q E', 'Bay khi chọn góc Bay'],
-                    ['Space / Shift', 'Nhảy / Chạy khi đi thử'],
-                    ['Esc', 'Hủy đặt / Về xưởng'],
-                  ].map(([k, v]) => (
-                    <div key={k}>
-                      <dt>
-                        <kbd>{k}</kbd>
-                      </dt>
-                      <dd>{v}</dd>
+                    <NumberField
+                      label="Góc đặt (độ)"
+                      value={(settings.rotation * 180) / Math.PI}
+                      min={-3600}
+                      max={3600}
+                      step={15}
+                      onChange={(v) => setSettings((s) => ({ ...s, rotation: (v * Math.PI) / 180 }))}
+                    />
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={settings.buildHeight !== null}
+                        onChange={(e) =>
+                          setSettings((s) => ({ ...s, buildHeight: e.target.checked ? 0 : null }))
+                        }
+                      />
+                      Xây trên một độ cao cố định
+                    </label>
+                    {settings.buildHeight !== null && (
+                      <NumberField
+                        label="Độ cao xây"
+                        value={settings.buildHeight}
+                        min={0}
+                        max={500}
+                        onChange={(v) => setSettings((s) => ({ ...s, buildHeight: v }))}
+                      />
+                    )}
+                    <button
+                      className="full"
+                      disabled={!project || (settings.kind === 'model' && !settings.assetId)}
+                      onClick={addAtCenter}
+                    >
+                      Đặt tại tâm bản đồ
+                    </button>
+                  </>
+                ) : first ? (
+                  <>
+                    <label className="field">
+                      Tên vật thể
+                      <input
+                        key={first.id + first.name}
+                        defaultValue={first.name}
+                        maxLength={100}
+                        onBlur={(e) => {
+                          if (e.target.value.trim() && e.target.value !== first.name)
+                            patchSelected({ name: e.target.value.trim() });
+                        }}
+                      />
+                    </label>
+                    <div className="section-heading">
+                      <h3>Vị trí</h3>
+                      <button onClick={() => world.current?.focus()}>
+                        Nhìn gần <kbd>F</kbd>
+                      </button>
                     </div>
-                  ))}
-                </dl>
-              </section>
-            </div>
-            <h3>Lưu và giới hạn</h3>
-            <p>
-              Tự lưu sau khoảng 1,6 giây ngừng chỉnh; giữ 5 bản dự phòng. Gói dự án tối đa 64 MB, mỗi GLB tối
-              đa 32 MB, tối đa 5.000 vật thể. Hiệu năng phụ thuộc độ nặng mô hình và máy. GLB dùng dữ liệu
-              nhúng, không hỗ trợ Draco/Meshopt/KTX2 trong bản này.
-            </p>
-            <p>
-              Khối va chạm là hộp bao của từng phần, có thể rộng hơn hình thật ở vật thể xoay hoặc mái dốc.
-              Đây là công cụ lắp ghép cảnh, chưa có sửa đỉnh hoặc điêu khắc như Blender.
-            </p>
-          </Modal>
-        )}
-        {panel === 'export' && (
-          <Modal title="Xuất bản đồ" onClose={() => setPanel(null)}>
-            <div className="export-options">
-              <button disabled={busy} onClick={exportProject}>
-                <strong>Gói dự án .3dmaker.json</strong>
-                <span>Giữ vật thể, tài nguyên, mẫu và điểm bắt đầu để mở sửa tiếp.</span>
-              </button>
-              <button disabled={busy} onClick={() => void exportGLB()}>
-                <strong>Mô hình toàn cảnh .glb</strong>
-                <span>Đưa hình học và vật liệu sang công cụ 3D khác.</span>
-              </button>
-              <button disabled={busy || !selected.length} onClick={() => void exportGLB(true)}>
-                <strong>Xuất phần đang chọn .glb</strong>
-                <span>{selected.length} vật thể đang chọn.</span>
-              </button>
-              <button disabled={busy} onClick={screenshot}>
-                <strong>Ảnh chụp .png</strong>
-                <span>Chụp góc nhìn hiện tại, không có bảng công cụ.</span>
-              </button>
-            </div>
-          </Modal>
-        )}
-        {panel === 'backups' && (
-          <Modal title="Bản lưu dự phòng" onClose={() => setPanel(null)}>
-            <p className="muted">
-              Mỗi lần lưu thành công sẽ giữ lại bản trước đó, tối đa 5 bản. Khôi phục sẽ giữ bản hiện tại để
-              có thể quay lại.
-            </p>
-            {backups.length ? (
-              backups.map((b) => (
-                <div key={b.file} className="backup-row">
-                  <span>{new Date(b.date).toLocaleString('vi-VN')}</span>
-                  <button
-                    disabled={busy}
-                    onClick={() =>
-                      setConfirm({
-                        title: 'Khôi phục bản lưu này?',
-                        message:
-                          'Cảnh hiện tại sẽ được thay bằng bản lưu đã chọn. Bạn có thể hoàn tác sau khi khôi phục.',
-                        action: () => {
-                          void (async () => {
-                            try {
-                              const data = await api<Project>(
-                                `/api/projects/${backupProjectId}/backups/${b.file}`,
-                              );
-                              if (
-                                projectRef.current?.id !== backupProjectId ||
-                                summaries.some((p) => p.id === backupProjectId && p.corrupt)
-                              ) {
-                                if (!(await save())) return;
-                                data.id = crypto.randomUUID();
-                                data.revision = 0;
-                                data.name = (data.name + ' (khôi phục)').slice(0, 100);
-                                open(
-                                  await api<Project>('/api/projects', {
-                                    method: 'POST',
-                                    body: JSON.stringify(data),
-                                  }),
-                                );
-                                notify('Đã khôi phục thành dự án mới.');
-                                return;
-                              }
-                              commit((p) => {
-                                p.objects = data.objects;
-                                p.assets = data.assets;
-                                p.prefabs = data.prefabs;
-                                p.environment = data.environment;
-                                p.spawn = data.spawn;
-                                p.name = data.name;
-                                p.palette = data.palette;
-                              });
-                              setSelection([]);
-                              setPanel(null);
-                              if (await save()) notify('Đã khôi phục bản lưu.');
-                            } catch (e) {
-                              setError((e as Error).message);
+                    {selected.length === 2 && (
+                      <p className="muted small">
+                        Khoảng cách giữa hai gốc:{' '}
+                        {Math.hypot(
+                          ...selected[0].position.map((n, i) => n - selected[1].position[i]),
+                        ).toFixed(2)}{' '}
+                        m
+                      </p>
+                    )}
+                    <div className="xyz">
+                      {(['X', 'Y', 'Z'] as const).map((axis, i) => (
+                        <NumberField
+                          key={axis}
+                          label={axis}
+                          value={first.position[i]}
+                          onChange={(v) =>
+                            commit((p) => {
+                              const delta = v - first.position[i];
+                              for (const o of p.objects)
+                                if (selection.includes(o.id) && !o.locked) o.position[i] += delta;
+                            })
+                          }
+                        />
+                      ))}
+                    </div>
+                    <h3>Góc xoay (độ)</h3>
+                    <div className="xyz">
+                      {(['X', 'Y', 'Z'] as const).map((axis, i) => (
+                        <NumberField
+                          key={axis}
+                          label={`Xoay ${axis}`}
+                          value={(first.rotation[i] * 180) / Math.PI}
+                          min={-3600}
+                          max={3600}
+                          step={15}
+                          onChange={(v) => {
+                            const r = [...first.rotation] as Vec3;
+                            r[i] = (v * Math.PI) / 180;
+                            patchSelected({ rotation: r });
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <h3>Kích thước / tỷ lệ</h3>
+                    <div className="xyz">
+                      {(['Rộng', 'Cao', 'Sâu'] as const).map((axis, i) => (
+                        <NumberField
+                          key={axis}
+                          label={axis}
+                          value={first.scale[i]}
+                          min={0.01}
+                          max={500}
+                          onChange={(v) => {
+                            const s = [...first.scale] as Vec3;
+                            s[i] = v;
+                            patchSelected({ scale: s });
+                          }}
+                        />
+                      ))}
+                    </div>
+                    {first.kind === 'model' && (
+                      <p className="muted small">
+                        GLB được chuẩn hóa cạnh dài nhất về 1 m. Kích thước ở đây là hệ số nhân theo trục.
+                      </p>
+                    )}
+                    <div className="button-grid">
+                      <button onClick={duplicate}>Nhân bản</button>
+                      <button onClick={() => setPanel('repeat')}>Lặp thành hàng</button>
+                      <button disabled={selected.length < 2} onClick={group}>
+                        Gom nhóm
+                      </button>
+                      <button
+                        disabled={!selected.some((o) => o.group)}
+                        onClick={() => patchSelected({ group: null })}
+                      >
+                        Tách nhóm
+                      </button>
+                      <button
+                        onClick={() =>
+                          commit((p) => {
+                            for (const o of p.objects)
+                              if (selection.includes(o.id) && !o.locked) o.position[1] = 0;
+                          })
+                        }
+                      >
+                        Đặt xuống nền
+                      </button>
+                      <button
+                        disabled={selected.length < 2}
+                        onClick={() =>
+                          commit((p) => {
+                            for (const o of p.objects)
+                              if (selection.includes(o.id) && !o.locked) o.position[2] = first.position[2];
+                          })
+                        }
+                      >
+                        Căn hàng theo Z
+                      </button>
+                    </div>
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={first.collision}
+                        onChange={(e) => patchSelected({ collision: e.target.checked })}
+                      />
+                      Có va chạm khi đi thử
+                    </label>
+                    <div className="button-grid">
+                      <button
+                        onClick={() => {
+                          patchSelected({ visible: false });
+                          setSelection([]);
+                          setLibraryTab('objects');
+                        }}
+                      >
+                        Ẩn vật thể
+                      </button>
+                      <button
+                        onClick={() => {
+                          patchSelected({ locked: true });
+                          setSelection([]);
+                          setLibraryTab('objects');
+                        }}
+                      >
+                        Khóa vật thể
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="muted intro">
+                    Chọn một bộ phận ở thư viện để xây, hoặc bấm vào vật thể để chỉnh sửa.
+                  </p>
+                )}
+                {first?.kind === 'model' && settings.tool !== 'build' && (
+                  <>
+                    <h3>Bộ phận mô hình GLB</h3>
+                    <p className="muted small">
+                      Tách các phần hình học có sẵn để sửa từng phần bằng công cụ của xưởng. Không tự phân
+                      chia mô hình liền khối.
+                    </p>
+                    <button
+                      className="full"
+                      disabled={busy || !!first.modelPart}
+                      onClick={() => void splitModel()}
+                    >
+                      Tách các bộ phận có sẵn
+                    </button>
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={first.tint ?? false}
+                        onChange={(e) => patchSelected({ tint: e.target.checked, material: 'plain' })}
+                      />
+                      Thay màu gốc của mô hình
+                    </label>
+                  </>
+                )}
+                {(first || settings.tool === 'build') && (
+                  <>
+                    <h3>Ảnh texture</h3>
+                    <div className="button-grid">
+                      <button disabled={busy} onClick={() => textureInput.current?.click()}>
+                        Chọn ảnh từ máy
+                      </button>
+                      <button disabled={busy} onClick={() => void pasteTexture()}>
+                        Dán ảnh clipboard
+                      </button>
+                    </div>
+                    <p className="muted small">
+                      Chọn bộ phận rồi Ctrl+V để dán ảnh. PNG/JPEG/WebP, tối đa 32 MB; cạnh dài được thu về
+                      tối đa 4096 px.
+                    </p>
+                    {project?.assets.some((a) => a.type === 'texture') && (
+                      <label className="field">
+                        Dùng ảnh đã nhập
+                        <select
+                          aria-label="Dùng ảnh đã nhập"
+                          value={activeTexture?.assetId ?? ''}
+                          onChange={(e) =>
+                            setTexture(
+                              e.target.value
+                                ? { assetId: e.target.value, repeat: [1, 1], rotation: 0 }
+                                : undefined,
+                            )
+                          }
+                        >
+                          <option value="">Không dùng ảnh</option>
+                          {project.assets
+                            .filter((a) => a.type === 'texture')
+                            .map((a) => (
+                              <option key={a.id} value={a.id}>
+                                {a.name}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                    )}
+                    {activeTexture && textureAsset && (
+                      <>
+                        <img
+                          className="texture-preview"
+                          src={`/api/assets/${textureAsset.fileId}`}
+                          width={200}
+                          height={120}
+                          alt={`Texture ${textureAsset.name}`}
+                        />
+                        <p className="small texture-name">{textureAsset.name}</p>
+                        <div className="xyz">
+                          <NumberField
+                            label="Lặp ngang"
+                            value={activeTexture.repeat[0]}
+                            min={0.05}
+                            max={100}
+                            onChange={(v) =>
+                              setTexture({ ...activeTexture, repeat: [v, activeTexture.repeat[1]] })
                             }
-                          })();
-                        },
-                      })
-                    }
-                  >
-                    Khôi phục
+                          />
+                          <NumberField
+                            label="Lặp dọc"
+                            value={activeTexture.repeat[1]}
+                            min={0.05}
+                            max={100}
+                            onChange={(v) =>
+                              setTexture({ ...activeTexture, repeat: [activeTexture.repeat[0], v] })
+                            }
+                          />
+                          <NumberField
+                            label="Xoay ảnh (độ)"
+                            value={activeTexture.rotation}
+                            min={-3600}
+                            max={3600}
+                            step={15}
+                            onChange={(rotation) => setTexture({ ...activeTexture, rotation })}
+                          />
+                        </div>
+                        <button className="full" onClick={() => setTexture(undefined)}>
+                          Gỡ texture khỏi bộ phận
+                        </button>
+                      </>
+                    )}
+                    <h3>Vật liệu</h3>
+                    <div className="material-grid">
+                      {materials.map((m) => (
+                        <button
+                          key={m.id}
+                          title={m.name}
+                          aria-label={`Vật liệu ${m.name}`}
+                          aria-pressed={
+                            (settings.tool === 'build' ? settings.material : first?.material) === m.id
+                          }
+                          style={{ '--material': m.color } as React.CSSProperties}
+                          onClick={() => {
+                            if (settings.tool === 'build')
+                              setSettings((s) => ({
+                                ...s,
+                                material: m.id,
+                                color: m.color,
+                                texture: undefined,
+                              }));
+                            else
+                              patchSelected({
+                                material: m.id,
+                                color: m.color,
+                                tint: first?.kind === 'model',
+                                texture: undefined,
+                              });
+                          }}
+                        >
+                          <span />
+                          <small>{m.name}</small>
+                        </button>
+                      ))}
+                    </div>
+                    <label className="color-field">
+                      Màu vật thể
+                      <input
+                        type="color"
+                        value={settings.tool === 'build' ? settings.color : (first?.color ?? '#aaaaaa')}
+                        onChange={(e) => {
+                          if (settings.tool === 'build')
+                            setSettings((s) => ({ ...s, color: e.target.value }));
+                          else patchSelected({ color: e.target.value, tint: first?.kind === 'model' });
+                        }}
+                      />
+                    </label>
+                    <div className="color-history">
+                      {favoriteColors.map((c) => (
+                        <button
+                          key={c}
+                          title={`Dùng màu ${c}`}
+                          aria-label={`Dùng màu ${c}`}
+                          style={{ background: c }}
+                          onClick={() =>
+                            settings.tool === 'build'
+                              ? setSettings((s) => ({ ...s, color: c }))
+                              : patchSelected({ color: c, tint: first?.kind === 'model' })
+                          }
+                        />
+                      ))}
+                      <button
+                        onClick={() => {
+                          const c = settings.tool === 'build' ? settings.color : first?.color;
+                          if (c)
+                            commit((p) => {
+                              p.palette = [...new Set([c, ...(p.palette ?? [])])].slice(0, 8);
+                            });
+                        }}
+                      >
+                        + Lưu màu
+                      </button>
+                    </div>
+                    {first && settings.tool !== 'build' && (
+                      <>
+                        <NumberField
+                          label="Độ nhám"
+                          value={first.roughness}
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          onChange={(roughness) => patchSelected({ roughness })}
+                        />
+                        <NumberField
+                          label="Độ kim loại"
+                          value={first.metalness}
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          onChange={(metalness) => patchSelected({ metalness })}
+                        />
+                      </>
+                    )}
+                  </>
+                )}
+                {first && settings.tool !== 'build' && (
+                  <>
+                    <h3>Lưu thành mẫu</h3>
+                    <label className="field">
+                      Tên mẫu
+                      <input
+                        value={prefabName}
+                        maxLength={100}
+                        onChange={(e) => setPrefabName(e.target.value)}
+                      />
+                    </label>
+                    <button className="full" onClick={savePrefab}>
+                      Lưu {selected.length} bộ phận vào thư viện
+                    </button>
+                    <button className="danger full" onClick={() => removeObjects()}>
+                      Xóa vật thể đã chọn
+                    </button>
+                  </>
+                )}
+                <details className="environment" open={!first && settings.tool !== 'build'}>
+                  <summary>Không gian & hiển thị</summary>
+                  {project && (
+                    <>
+                      <NumberField
+                        label="Cạnh bản đồ (m)"
+                        value={project.environment.size}
+                        min={10}
+                        max={500}
+                        step={10}
+                        onChange={(size) =>
+                          commit((p) => {
+                            p.environment.size = size;
+                          })
+                        }
+                      />
+                      <label className="color-field">
+                        Màu nền đất
+                        <input
+                          type="color"
+                          value={project.environment.ground}
+                          onChange={(e) =>
+                            commit((p) => {
+                              p.environment.ground = e.target.value;
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="color-field">
+                        Màu trời
+                        <input
+                          type="color"
+                          value={project.environment.sky}
+                          onChange={(e) =>
+                            commit((p) => {
+                              p.environment.sky = e.target.value;
+                            })
+                          }
+                        />
+                      </label>
+                      <NumberField
+                        label="Hướng nắng (độ)"
+                        value={project.environment.sun}
+                        min={0}
+                        max={360}
+                        step={15}
+                        onChange={(sun) =>
+                          commit((p) => {
+                            p.environment.sun = sun;
+                          })
+                        }
+                      />
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={project.environment.shadows}
+                          onChange={(e) =>
+                            commit((p) => {
+                              p.environment.shadows = e.target.checked;
+                            })
+                          }
+                        />
+                        Bóng đổ
+                      </label>
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={settings.collisionHelpers}
+                          onChange={(e) => setSettings((s) => ({ ...s, collisionHelpers: e.target.checked }))}
+                        />
+                        Hiện khối va chạm
+                      </label>
+                      <button className="full" onClick={() => tool('spawn')}>
+                        Đặt điểm bắt đầu đi thử
+                      </button>
+                      <p className="muted small">
+                        Điểm bắt đầu: {project.spawn.map((n) => n.toFixed(1)).join(' / ')}
+                      </p>
+                    </>
+                  )}
+                  <label className="field">
+                    Chất lượng
+                    <select
+                      value={settings.quality}
+                      onChange={(e) =>
+                        setSettings((s) => ({ ...s, quality: e.target.value as 'low' | 'high' }))
+                      }
+                    >
+                      <option value="high">Cao</option>
+                      <option value="low">Nhẹ máy</option>
+                    </select>
+                  </label>
+                  <NumberField
+                    label="Tốc độ bay"
+                    value={settings.flySpeed}
+                    min={1}
+                    max={40}
+                    step={1}
+                    onChange={(flySpeed) => setSettings((s) => ({ ...s, flySpeed }))}
+                  />
+                </details>
+                {project && (
+                  <button className="full" disabled={busy} onClick={() => void showBackups()}>
+                    Bản lưu dự phòng
                   </button>
-                </div>
-              ))
-            ) : (
-              <p>Chưa có bản dự phòng. Sau khi bạn chỉnh và lưu, bản trước sẽ xuất hiện ở đây.</p>
-            )}
-          </Modal>
-        )}
-        {panel === 'repeat' && (
-          <Modal title="Lặp vật thể thành hàng" onClose={() => setPanel(null)}>
-            <p>Giữ phần gốc và thêm các bản sao theo khoảng cách dưới đây.</p>
-            <NumberField
-              label="Số bản sao thêm"
-              value={repeatCount}
-              min={1}
-              max={100}
-              step={1}
-              onChange={(v) => setRepeatCount(Math.round(v))}
-            />
-            <div className="xyz">
-              {['X', 'Y', 'Z'].map((axis, i) => (
-                <NumberField
-                  key={axis}
-                  label={`Khoảng ${axis}`}
-                  value={repeatOffset[i]}
-                  onChange={(v) => setRepeatOffset((old) => old.map((n, j) => (i === j ? v : n)) as Vec3)}
-                />
-              ))}
+                )}
+              </div>
+            </aside>
+          </div>
+          <footer className="app-footer">
+            <span>Lưu trên máy của bạn</span>
+            <span>{busy ? 'Đang xử lý tài nguyên…' : 'Chỉ chạy localhost · Không cần tài khoản'}</span>
+            <button onClick={() => setPanel('help')}>Phím tắt & hướng dẫn</button>
+          </footer>
+          {notice && (
+            <div className="toast" role="status">
+              {notice}
+              <button aria-label="Đóng thông báo" onClick={() => setNotice('')}>
+                ✕
+              </button>
             </div>
-            <button
-              className="primary full"
-              onClick={() => {
-                const objects: SceneObject[] = [];
-                for (let i = 1; i <= repeatCount; i++)
-                  objects.push(...duplicateObjects(selected, repeatOffset.map((n) => n * i) as Vec3));
-                addObjects(objects);
-                setPanel(null);
-              }}
-            >
-              Thêm {repeatCount * selected.length} vật thể
-            </button>
-          </Modal>
-        )}
-        {confirm && (
-          <Modal title={confirm.title} onClose={() => setConfirm(null)}>
-            <p>{confirm.message}</p>
-            <div className="dialog-actions">
-              <button onClick={() => setConfirm(null)}>Hủy</button>
-              <button
-                className="primary"
-                onClick={() => {
-                  const action = confirm.action;
-                  setConfirm(null);
-                  action();
+          )}
+          {uploadStatus && (
+            <div className="upload-progress" role="status">
+              <span>{uploadStatus}</span>
+              <button disabled={!uploadCanCancel} onClick={() => uploadRequest.current?.abort()}>
+                Hủy tải
+              </button>
+            </div>
+          )}
+          {error && (
+            <div className="error-banner" role="alert">
+              <span>{error}</span>
+              <button onClick={() => setError('')}>Đóng lỗi</button>
+              {dirty && <button onClick={exportMetadata}>Xuất để giữ thay đổi</button>}
+            </div>
+          )}
+          <input
+            className="sr-only"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            aria-label="Chọn ảnh texture"
+            ref={textureInput}
+            tabIndex={-1}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) void importTexture(file);
+            }}
+          />
+          <input
+            className="sr-only"
+            type="file"
+            accept=".glb"
+            ref={assetInput}
+            aria-label="Chọn mô hình GLB"
+            tabIndex={-1}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = '';
+              if (f) void importAsset(f);
+            }}
+          />
+          <input
+            className="sr-only"
+            type="file"
+            accept=".json,.3dmaker,.zip"
+            ref={projectInput}
+            aria-label="Chọn gói dự án"
+            tabIndex={-1}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = '';
+              if (f) void importProject(f);
+            }}
+          />
+          {panel === 'projects' && (
+            <Modal wide title="Bản đồ của bạn" onClose={() => setPanel(null)}>
+              <p className="muted">
+                Một khoảng đất trống, hoặc một khu vườn để bắt đầu. Mọi thay đổi được lưu ngay trên máy này.
+              </p>
+              <div className="project-actions">
+                <button className="primary" disabled={busy} onClick={() => setPanel('new')}>
+                  + Tạo bản đồ
+                </button>
+                <button disabled={busy} onClick={() => void create(true)}>
+                  Mở cảnh mẫu
+                </button>
+                <button disabled={busy} onClick={() => projectInput.current?.click()}>
+                  Nhập gói dự án
+                </button>
+                <button disabled={loading} onClick={() => void listProjects()}>
+                  Làm mới
+                </button>
+              </div>
+              <div className="project-list">
+                {loading ? (
+                  <p role="status">Đang đọc dự án trên máy…</p>
+                ) : summaries.length ? (
+                  summaries.map((p) => (
+                    <article key={p.id} className="project-card">
+                      <div className="project-art">
+                        {p.thumbnail ? (
+                          <img src={p.thumbnail} width={105} height={85} alt={`Ảnh xem trước ${p.name}`} />
+                        ) : (
+                          <span className="small muted">Chưa có ảnh</span>
+                        )}
+                        <small>{p.count} vật thể</small>
+                      </div>
+                      <div>
+                        <h3>{p.name}</h3>
+                        <p>
+                          {p.updatedAt
+                            ? new Date(p.updatedAt).toLocaleString('vi-VN')
+                            : 'Kiểm tra thư mục data/backups'}
+                        </p>
+                        <div className="project-card-actions">
+                          <button
+                            className="primary"
+                            disabled={busy || p.corrupt}
+                            onClick={() => void openId(p.id)}
+                          >
+                            Mở bản đồ
+                          </button>
+                          <button disabled={busy || p.corrupt} onClick={() => void copyProject(p)}>
+                            Tạo bản sao
+                          </button>
+                          <button disabled={busy} onClick={() => void showBackups(p.id)}>
+                            Bản dự phòng
+                          </button>
+                          <button
+                            className="danger"
+                            disabled={busy}
+                            onClick={() =>
+                              setConfirm({
+                                title: 'Chuyển dự án vào thùng lưu?',
+                                message:
+                                  'Dự án sẽ chuyển vào data/trash trên máy, không xóa vĩnh viễn. Nếu đang mở, thay đổi hiện tại sẽ được lưu trước.',
+                                action: () => {
+                                  void (async () => {
+                                    if (projectRef.current?.id === p.id && !(await save())) return;
+                                    try {
+                                      await api(`/api/projects/${p.id}`, { method: 'DELETE' });
+                                      if (projectRef.current?.id === p.id) {
+                                        projectRef.current = null;
+                                        setProject(null);
+                                        setSelection([]);
+                                        changed.current = saved.current;
+                                        setDirty(false);
+                                        setStatus('Chưa mở dự án');
+                                        setSettings((s) => ({ ...s, walk: false, tool: 'select' }));
+                                      }
+                                      await listProjects();
+                                    } catch (e) {
+                                      setError((e as Error).message);
+                                    }
+                                  })();
+                                },
+                              })
+                            }
+                          >
+                            Cất vào thùng lưu
+                          </button>
+                        </div>
+                      </div>
+                    </article>
+                  ))
+                ) : (
+                  <div className="empty-projects">
+                    <strong>Chưa có bản đồ nào.</strong>
+                    <p>Tạo bản đồ trống hoặc mở cảnh mẫu để thử xây ngay.</p>
+                  </div>
+                )}
+              </div>
+              <p className="small muted">
+                Bản đồ: data/*.json · File GLB/ảnh: data/assets/ · Dùng gói ZIP để mang đủ tài nguyên.
+              </p>
+            </Modal>
+          )}
+          {panel === 'new' && (
+            <Modal title="Tạo bản đồ mới" onClose={() => setPanel('projects')}>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void create();
                 }}
               >
-                Xác nhận
+                <label className="field">
+                  Tên bản đồ
+                  <input
+                    autoFocus
+                    value={newName}
+                    maxLength={100}
+                    required
+                    onChange={(e) => setNewName(e.target.value)}
+                  />
+                </label>
+                <NumberField
+                  label="Cạnh nền (m)"
+                  value={newSize}
+                  min={10}
+                  max={500}
+                  step={10}
+                  onChange={setNewSize}
+                />
+                <p className="muted">
+                  Có thể đổi kích thước nền trong lúc xây. Bắt đầu từ 40 m sẽ dễ quan sát hơn.
+                </p>
+                <button className="primary full" disabled={busy || !newName.trim()} type="submit">
+                  Tạo và mở bản đồ
+                </button>
+              </form>
+            </Modal>
+          )}
+          {panel === 'help' && (
+            <Modal wide title="Xây bản đồ theo cách của bạn" onClose={() => setPanel(null)}>
+              <div className="help-layout">
+                <section>
+                  <h3>Bắt đầu</h3>
+                  <ol>
+                    <li>Chọn một bộ phận từ thư viện bên trái.</li>
+                    <li>Rê chuột để xem bản mờ, bấm xuống nền để đặt. Giữ và kéo để đặt liên tiếp.</li>
+                    <li>Dùng Chọn, rồi Di chuyển / Xoay / Kích thước để chỉnh.</li>
+                    <li>Chọn Đi thử để đi bộ trong bản đồ. Bấm vào cảnh để giữ chuột.</li>
+                  </ol>
+                  <h3>Mẹo tiết kiệm thao tác</h3>
+                  <p>
+                    Ctrl + bấm chọn nhiều; Shift + kéo chọn vùng. Nhóm được chọn cùng nhau; Alt + bấm chọn
+                    riêng một phần.
+                  </p>
+                  <p>
+                    Lặp thành hàng tạo nhiều bản sao theo khoảng cách bạn nhập. Lưu thành mẫu để tái sử dụng
+                    cả công trình.
+                  </p>
+                  <p>
+                    Khóa hoặc ẩn vật thể trong danh sách bên trái. Bật Hiện khối va chạm để xem những vùng
+                    chặn người đi.
+                  </p>
+                </section>
+                <section>
+                  <h3>Phím tắt</h3>
+                  <dl className="shortcuts">
+                    {[
+                      ['V / B', 'Chọn / Xây'],
+                      ['G / R / T', 'Di chuyển / Xoay / Kích thước'],
+                      ['X / I / P', 'Xóa / Lấy mẫu / Điểm bắt đầu'],
+                      ['[ / ]', 'Xoay bộ phận trước khi đặt'],
+                      ['F', 'Nhìn gần vật thể'],
+                      ['Ctrl D / Ctrl G', 'Nhân bản / Gom nhóm'],
+                      ['Ctrl A', 'Chọn tất cả vật thể khả dụng'],
+                      ['Ctrl Z / Ctrl Shift Z', 'Hoàn tác / Làm lại'],
+                      ['Ctrl S', 'Lưu dự án'],
+                      ['Delete', 'Xóa vật thể đang chọn'],
+                      ['W A S D / Q E', 'Bay khi chọn góc Bay'],
+                      ['Space / Shift', 'Nhảy / Chạy khi đi thử'],
+                      ['Esc', 'Hủy đặt / Về xưởng'],
+                    ].map(([k, v]) => (
+                      <div key={k}>
+                        <dt>
+                          <kbd>{k}</kbd>
+                        </dt>
+                        <dd>{v}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </section>
+              </div>
+              <h3>Lưu và giới hạn</h3>
+              <p>
+                Tự lưu sau khoảng 1,6 giây ngừng chỉnh; giữ 5 bản dự phòng. GLB nhỏ hơn 1 GB, gói ZIP tối đa 4
+                GB, mô tả bản đồ 64 MB, tối đa 5.000 vật thể. File GLB/texture lưu riêng; sao lưu cả thư mục
+                data. Hiệu năng phụ thuộc RAM/GPU và độ nặng mô hình. GLB dùng dữ liệu nhúng, không hỗ trợ
+                Draco/Meshopt/KTX2 trong bản này.
+              </p>
+              <p>
+                Khối va chạm là hộp bao của từng phần, có thể rộng hơn hình thật ở vật thể xoay hoặc mái dốc.
+                Đây là công cụ lắp ghép cảnh, chưa có sửa đỉnh hoặc điêu khắc như Blender.
+              </p>
+            </Modal>
+          )}
+          {panel === 'export' && (
+            <Modal title="Xuất bản đồ" onClose={() => setPanel(null)}>
+              <div className="export-options">
+                <button disabled={busy} onClick={exportProject}>
+                  <strong>Gói dự án .3dmaker.zip</strong>
+                  <span>Giữ vật thể, tài nguyên, mẫu và điểm bắt đầu để mở sửa tiếp.</span>
+                </button>
+                <button onClick={exportMetadata}>
+                  <strong>Bản mô tả .3dmaker.json</strong>
+                  <span>
+                    Dự phòng khi máy chủ không lưu được. File GLB/ảnh riêng vẫn cần data/assets trên máy này.
+                  </span>
+                </button>
+                <button disabled={busy} onClick={() => void exportGLB()}>
+                  <strong>Mô hình toàn cảnh .glb</strong>
+                  <span>Đưa hình học và vật liệu sang công cụ 3D khác.</span>
+                </button>
+                <button disabled={busy || !selected.length} onClick={() => void exportGLB(true)}>
+                  <strong>Xuất phần đang chọn .glb</strong>
+                  <span>{selected.length} vật thể đang chọn.</span>
+                </button>
+                <button disabled={busy} onClick={screenshot}>
+                  <strong>Ảnh chụp .png</strong>
+                  <span>Chụp góc nhìn hiện tại, không có bảng công cụ.</span>
+                </button>
+              </div>
+            </Modal>
+          )}
+          {panel === 'backups' && (
+            <Modal title="Bản lưu dự phòng" onClose={() => setPanel(null)}>
+              <p className="muted">
+                Mỗi lần lưu thành công sẽ giữ lại bản trước đó, tối đa 5 bản. Khôi phục sẽ giữ bản hiện tại để
+                có thể quay lại.
+              </p>
+              {backups.length ? (
+                backups.map((b) => (
+                  <div key={b.file} className="backup-row">
+                    <span>{new Date(b.date).toLocaleString('vi-VN')}</span>
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        setConfirm({
+                          title: 'Khôi phục bản lưu này?',
+                          message:
+                            'Cảnh hiện tại sẽ được thay bằng bản lưu đã chọn. Bạn có thể hoàn tác sau khi khôi phục.',
+                          action: () => {
+                            void (async () => {
+                              try {
+                                const data = await api<Project>(
+                                  `/api/projects/${backupProjectId}/backups/${b.file}`,
+                                );
+                                if (
+                                  projectRef.current?.id !== backupProjectId ||
+                                  summaries.some((p) => p.id === backupProjectId && p.corrupt)
+                                ) {
+                                  if (!(await save())) return;
+                                  data.id = crypto.randomUUID();
+                                  data.revision = 0;
+                                  data.name = (data.name + ' (khôi phục)').slice(0, 100);
+                                  open(
+                                    await api<Project>('/api/projects', {
+                                      method: 'POST',
+                                      body: JSON.stringify(data),
+                                    }),
+                                  );
+                                  notify('Đã khôi phục thành dự án mới.');
+                                  return;
+                                }
+                                commit((p) => {
+                                  p.objects = data.objects;
+                                  p.assets = data.assets;
+                                  p.prefabs = data.prefabs;
+                                  p.environment = data.environment;
+                                  p.spawn = data.spawn;
+                                  p.name = data.name;
+                                  p.palette = data.palette;
+                                });
+                                setSelection([]);
+                                setPanel(null);
+                                if (await save()) notify('Đã khôi phục bản lưu.');
+                              } catch (e) {
+                                setError((e as Error).message);
+                              }
+                            })();
+                          },
+                        })
+                      }
+                    >
+                      Khôi phục
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <p>Chưa có bản dự phòng. Sau khi bạn chỉnh và lưu, bản trước sẽ xuất hiện ở đây.</p>
+              )}
+            </Modal>
+          )}
+          {panel === 'repeat' && (
+            <Modal title="Lặp vật thể thành hàng" onClose={() => setPanel(null)}>
+              <p>Giữ phần gốc và thêm các bản sao theo khoảng cách dưới đây.</p>
+              <NumberField
+                label="Số bản sao thêm"
+                value={repeatCount}
+                min={1}
+                max={100}
+                step={1}
+                onChange={(v) => setRepeatCount(Math.round(v))}
+              />
+              <div className="xyz">
+                {['X', 'Y', 'Z'].map((axis, i) => (
+                  <NumberField
+                    key={axis}
+                    label={`Khoảng ${axis}`}
+                    value={repeatOffset[i]}
+                    onChange={(v) => setRepeatOffset((old) => old.map((n, j) => (i === j ? v : n)) as Vec3)}
+                  />
+                ))}
+              </div>
+              <button
+                className="primary full"
+                onClick={() => {
+                  const objects: SceneObject[] = [];
+                  for (let i = 1; i <= repeatCount; i++)
+                    objects.push(...duplicateObjects(selected, repeatOffset.map((n) => n * i) as Vec3));
+                  addObjects(objects);
+                  setPanel(null);
+                }}
+              >
+                Thêm {repeatCount * selected.length} vật thể
               </button>
-            </div>
-          </Modal>
-        )}
-      </div>
+            </Modal>
+          )}
+          {confirm && (
+            <Modal title={confirm.title} onClose={() => setConfirm(null)}>
+              <p>{confirm.message}</p>
+              <div className="dialog-actions">
+                <button onClick={() => setConfirm(null)}>Hủy</button>
+                <button
+                  className="primary"
+                  onClick={() => {
+                    const action = confirm.action;
+                    setConfirm(null);
+                    action();
+                  }}
+                >
+                  Xác nhận
+                </button>
+              </div>
+            </Modal>
+          )}
+        </div>
+      </UploadContext.Provider>
     </ErrorContext.Provider>
   );
 }
